@@ -78,6 +78,7 @@ EXTRA="--attention-backend $ATTN_BACKEND --memory-ratio $MEMORY_RATIO"
 echo "AFD hybrid bench: model=$MODEL_PATH arch=$ARCH A=$AFD_ATTN_DP_SIZE F=$AFD_MLP_DP_SIZE mb=$AFD_NUM_MB"
 echo "  batch_sizes=$BATCH_SIZES graph_bs=$AFD_DECODE_GRAPH_BS prompt=$PROMPT_LEN max_tokens=$MAX_TOKENS"
 
+bash "$REPO_ROOT/scripts/kill_afd_ray_tasks.sh" >/dev/null 2>&1 || true  # leftovers of an earlier case
 RAY_DEDUP_LOGS=0 "$REPO_ROOT/scripts/serve/fastafd_server.sh" \
   --model "$MODEL_PATH" --host 127.0.0.1 --port "$PORT" \
   --launch-backend ray --ray-address "$RAY_ADDRESS" \
@@ -91,10 +92,14 @@ RAY_DEDUP_LOGS=0 "$REPO_ROOT/scripts/serve/fastafd_server.sh" \
   --afd-device-comm-num-sms 4 --max-seq-len-override "$MAX_SEQ_LEN" \
   --extra-args "$EXTRA" > "$RUN_DIR/afd.log" 2>&1 &
 SERVER_PID=$!
+cleanup_ray_workers() {  # hung workers of a killed server keep their GPUs otherwise
+  bash "$REPO_ROOT/scripts/kill_afd_ray_tasks.sh" >/dev/null 2>&1 || true
+}
 stop_server() {
   kill -TERM "$SERVER_PID" 2>/dev/null || true
   for _ in $(seq 1 30); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
   kill -KILL "$SERVER_PID" 2>/dev/null || true
+  cleanup_ray_workers
 }
 trap stop_server EXIT
 
