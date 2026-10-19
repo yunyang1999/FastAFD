@@ -206,3 +206,15 @@ sbatch -N 9 --segment=9 --account=<acct> --partition=<gb200 partition> --time=03
   reference (FP8 W8A8 GEMMs in the engine); Kimi-K3 layers {0, 3} + embed/head:
   6.4-6.9e-3, argmax agreement 1.0. Loader round trip is bit-exact for the
   colocated models, the AFD attention stages and the expert-worker slices.
+* sglang 0.5.18 kernels (`tests/dsv4_k3/test_vs_sglang.py`): KDA prefill
+  (`causal_conv1d_fn` + `chunk_kda`, varlen, with/without initial state) and
+  decode (`causal_conv1d_update` + `fused_sigmoid_gating_delta_rule_update`)
+  agree to rel-L2 2.8e-3-5.7e-3 (outputs, final states; conv state exact). The
+  mHC comparison needs sglang's tilelang JIT, which did not compile in the
+  available sglang env (CUDA header/toolchain mismatch).
+* AFD vs colocated on real weights (truncated checkpoints, greedy, 8 prompts x
+  16 tokens, 2A2F): Kimi-K3 identical in 7/8 prompts (92 % of positions).
+  DeepSeek-V4-Flash 26 %, rising to 69 % when the colocated shared expert also
+  uses the MXFP4-requantised weights that the MegaMoE expert workers run
+  (colocated FP8 vs MXFP4 shared alone: 30 %), i.e. the difference is the
+  shared-expert precision imposed by the measured MegaMoE stage.
