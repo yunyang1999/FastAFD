@@ -36,7 +36,7 @@ for spec in $CASES; do
   else
     unset MINISGL_TOKENIZER_PATH
   fi
-  tag="${m}_L${depth}_${A}a${F}f_mb${MB}"
+  tag="${m}_L${depth}_${A}a${F}f_mb${MB}_bs${BS//\//-}"
   echo "===== $tag bs=${BS//\//,} $(date -u +%T)"
   AFD_NUM_MB="$MB" AFD_ATTN_DP_SIZE="$A" AFD_MLP_DP_SIZE="$F" BATCH_SIZES="${BS//\//,}" MODEL_PATH="$mdir" RUN_DIR="$AFD_OUT_DIR/$tag" \
     timeout "${CASE_TIMEOUT:-3600}" bash "$SCRIPT_DIR/run_afd_hybrid_bench.sh" > "$AFD_OUT_DIR/$tag.out" 2>&1
