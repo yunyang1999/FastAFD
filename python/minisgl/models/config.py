@@ -55,8 +55,30 @@ class ModelConfig:
     def is_moe(self) -> bool:
         return self.num_experts > 0
 
+    @property
+    def arch(self) -> str:
+        return (self.architectures or [""])[0]
+
+    @property
+    def is_deepseek_v4(self) -> bool:
+        return self.model_type == "deepseek_v4"
+
+    @property
+    def is_kimi_k3(self) -> bool:
+        return self.model_type in ("kimi_k3", "kimi_linear")
+
+    @property
+    def hf_text_config(self) -> Dict[str, Any]:
+        """Raw (text) HF config dict carrying model-specific fields."""
+        return self.model_extra.get("hf_text_config", {})
+
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+        model_type = getattr(config, "model_type", "")
+        if model_type == "deepseek_v4":
+            return _deepseek_v4_from_hf(cls, config)
+        if model_type in ("kimi_k3", "kimi_linear"):
+            return _kimi_k3_from_hf(cls, config)
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -190,3 +212,124 @@ class ModelConfig:
             partial_rotary_factor=partial_rotary_factor,
             model_extra=model_extra,
         )
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 / Kimi-K3 (hybrid attention, latent / hyper-connection models)
+# ---------------------------------------------------------------------------
+
+
+def _config_to_dict(config: Any) -> Dict[str, Any]:
+    if isinstance(config, dict):
+        return dict(config)
+    to_dict = getattr(config, "to_dict", None)
+    if callable(to_dict):
+        return dict(to_dict())
+    return dict(vars(config))
+
+
+def _rope_cfg(head_dim: int, rotary_dim: int, d: Dict[str, Any]) -> RotaryConfig:
+    # YaRN for DeepSeek-V4 is applied model-locally (see models/deepseek_v4.py);
+    # the generic rope factory is never used for these models.
+    rope_scaling = d.get("rope_scaling")
+    return RotaryConfig(
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        max_position=int(d.get("max_position_embeddings", 4096)),
+        base=float(d.get("rope_theta", 10000.0) or 10000.0),
+        scaling=None,
+        parameters=dict(rope_scaling) if rope_scaling else None,
+        partial_rotary_factor=None,
+    )
+
+
+def _deepseek_v4_from_hf(cls, config: Any) -> "ModelConfig":
+    d = _config_to_dict(config)
+    num_layers = int(d["num_hidden_layers"])
+    quant = None
+    qc = d.get("quantization_config") or {}
+    if "fp8" in str(qc.get("quant_method", "")):
+        block = qc.get("weight_block_size", [128, 128])
+        quant = QuantConfig(
+            method="fp8",
+            activation_scheme=qc.get("activation_scheme", "dynamic"),
+            weight_block_size=(int(block[0]), int(block[1])),
+        )
+    head_dim = int(d["head_dim"])
+    return cls(
+        num_layers=num_layers,
+        num_qo_heads=int(d["num_attention_heads"]),
+        num_kv_heads=int(d.get("num_key_value_heads", 1)),
+        head_dim=head_dim,
+        hidden_size=int(d["hidden_size"]),
+        vocab_size=int(d["vocab_size"]),
+        intermediate_size=int(d["moe_intermediate_size"]),
+        rms_norm_eps=float(d["rms_norm_eps"]),
+        rotary_config=_rope_cfg(head_dim, int(d["qk_rope_head_dim"]), d),
+        hidden_act=str(d.get("hidden_act", "silu")),
+        tie_word_embeddings=bool(d.get("tie_word_embeddings", False)),
+        num_experts=int(d["n_routed_experts"]),
+        num_experts_per_tok=int(d["num_experts_per_tok"]),
+        moe_intermediate_size=int(d["moe_intermediate_size"]),
+        norm_topk_prob=bool(d.get("norm_topk_prob", True)),
+        use_routing_bias=True,
+        scoring_func=str(d.get("scoring_func", "sqrtsoftplus")),
+        model_type="deepseek_v4",
+        architectures=list(d.get("architectures") or ["DeepseekV4ForCausalLM"]),
+        quant=quant,
+        rope_theta=float(d.get("rope_theta", 10000.0)),
+        rope_scaling=d.get("rope_scaling"),
+        model_extra={
+            "hf_text_config": d,
+            "n_shared_experts": int(d.get("n_shared_experts", 1)),
+            "routed_scaling_factor": float(d.get("routed_scaling_factor", 1.0)),
+            "first_k_dense_replace": 0,
+        },
+    )
+
+
+def _kimi_k3_from_hf(cls, config: Any) -> "ModelConfig":
+    top = _config_to_dict(config)
+    text = top.get("text_config")
+    if text is None:
+        text = top
+    d = _config_to_dict(text)
+    archs = list(top.get("architectures") or ["KimiK3ForConditionalGeneration"])
+    num_layers = int(d["num_hidden_layers"])
+    qk_head = int(d["qk_nope_head_dim"]) + int(d["qk_rope_head_dim"])
+    num_heads = int(d["num_attention_heads"])
+    return cls(
+        num_layers=num_layers,
+        num_qo_heads=num_heads,
+        num_kv_heads=int(d.get("num_key_value_heads") or num_heads),
+        head_dim=qk_head,
+        hidden_size=int(d["hidden_size"]),
+        vocab_size=int(d["vocab_size"]),
+        intermediate_size=int(d["intermediate_size"]),
+        rms_norm_eps=float(d["rms_norm_eps"]),
+        rotary_config=RotaryConfig(
+            head_dim=qk_head,
+            rotary_dim=int(d["qk_rope_head_dim"]),
+            max_position=int(d.get("max_position_embeddings", 4096)),
+            base=float(d.get("rope_theta", 10000.0) or 10000.0),
+            scaling=None,
+        ),
+        hidden_act=str(d.get("hidden_act", "situ")),
+        tie_word_embeddings=bool(top.get("tie_word_embeddings", d.get("tie_word_embeddings", False))),
+        num_experts=int(d["num_experts"]),
+        num_experts_per_tok=int(d["num_experts_per_token"]),
+        moe_intermediate_size=int(d["moe_intermediate_size"]),
+        norm_topk_prob=bool(d.get("moe_renormalize", True)),
+        use_routing_bias=True,
+        scoring_func=str(d.get("moe_router_activation_func", "sigmoid")),
+        model_type="kimi_k3",
+        architectures=archs,
+        quant=None,
+        rope_theta=float(d.get("rope_theta", 10000.0) or 10000.0),
+        model_extra={
+            "hf_text_config": d,
+            "n_shared_experts": int(d.get("num_shared_experts") or 0),
+            "routed_scaling_factor": float(d.get("routed_scaling_factor", 1.0)),
+            "first_k_dense_replace": int(d.get("first_k_dense_replace", 0)),
+        },
+    )
