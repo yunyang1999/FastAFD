@@ -33,6 +33,29 @@ def create_fi_backend(config: ModelConfig):
     return FlashInferBackend(config)
 
 
+@SUPPORTED_ATTENTION_BACKENDS.register("dsv4")
+def create_dsv4_backend(config: ModelConfig):
+    from .dsv4 import DSV4AttnBackend
+
+    return DSV4AttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register("kimi")
+def create_kimi_backend(config: ModelConfig):
+    from .kimi import KimiAttnBackend
+
+    return KimiAttnBackend(config)
+
+
+def model_attention_backend(config: ModelConfig) -> tuple[str, int] | None:
+    """(backend, page_size) forced by architectures with non-MHA attention."""
+    if getattr(config, "is_deepseek_v4", False):
+        return "dsv4", 128
+    if getattr(config, "is_kimi_k3", False):
+        return "kimi", 1
+    return None
+
+
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]
@@ -62,6 +85,7 @@ def create_attention_backend(
 
 
 __all__ = [
+    "model_attention_backend",
     "BaseAttnMetadata",
     "BaseAttnBackend",
     "create_attention_backend",

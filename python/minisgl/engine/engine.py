@@ -236,6 +236,9 @@ class Engine:
             with torch.device("meta"), torch_dtype(config.dtype):
                 self.model = create_model(config.model_config)
             self.model.load_state_dict(self._load_weight_state_dict(config))
+            post_load = getattr(self.model, "post_load", None)
+            if post_load is not None:
+                post_load(max_tokens_per_rank=max_forward_tokens(config))
 
             # ======================= KV cache initialization ========================
             self.num_pages = self._determine_num_pages(init_free_memory, config)
@@ -246,6 +249,8 @@ class Engine:
                 page_size=config.page_size,
                 device=self.device,
                 dtype=self.dtype,
+                num_req_slots=config.max_running_req + 1,
+                scratch_rows=max_forward_tokens(config),
             )
 
             # ======================= Page table initialization ========================
@@ -299,6 +304,15 @@ class Engine:
             pass
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        mc = config.model_config
+        if getattr(mc, "is_deepseek_v4", False) or getattr(mc, "is_kimi_k3", False):
+            if config.use_dummy_weight:
+                from minisgl.models.dummy_init import init_dummy_state_dict
+
+                return init_dummy_state_dict(self.model, self.device)
+            from minisgl.models.ckpt_loaders import load_hybrid_checkpoint
+
+            return load_hybrid_checkpoint(self.model, config.model_path, self.device)
         if config.use_dummy_weight:
             return {
                 k: torch.randn_like(v, device=self.device)
@@ -339,6 +353,8 @@ class Engine:
             }
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        from minisgl.kvcache import hybrid_cache_sizing
+
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
@@ -348,10 +364,23 @@ class Engine:
             * self.dtype.itemsize
             * config.model_config.num_layers
         )
+        fixed_bytes = 0
+        hybrid = hybrid_cache_sizing(
+            config.model_config,
+            page_size=config.page_size,
+            num_req_slots=config.max_running_req + 1,
+            scratch_rows=max_forward_tokens(config),
+        )
+        if hybrid is not None:
+            cache_per_page, fixed_bytes = hybrid
+            logger.info_rank0(
+                f"Hybrid cache: {cache_per_page / config.page_size:.0f} B/token, "
+                f"fixed {mem_GB(fixed_bytes)} for {config.max_running_req + 1} request slots"
+            )
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = int(config.memory_ratio * old_free_memory) - model_memory - fixed_bytes
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
@@ -408,9 +437,26 @@ def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
 
 
+def max_forward_tokens(config) -> int:
+    """Upper bound of tokens in one forward (prefill chunk or decode batch)."""
+    graph_bs = max(config.cuda_graph_bs or [0]) if config.cuda_graph_bs else int(config.cuda_graph_max_bs or 0)
+    return int(max(int(getattr(config, "max_extend_tokens", 8192)), int(config.max_running_req), graph_bs)) + 64
+
+
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
+
+    from minisgl.attention import model_attention_backend
+
+    forced = model_attention_backend(config.model_config)
+    if forced is not None:
+        backend, page_size = forced
+        if config.attention_backend not in ("auto", backend):
+            logger.warning_rank0(f"{config.model_config.arch} requires attention backend {backend}")
+        override("attention_backend", backend)
+        override("page_size", page_size)
+        logger.info_rank0(f"Model attention backend: {backend} page_size={page_size}")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else "fi"

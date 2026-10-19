@@ -24,14 +24,63 @@ class CacheManagerCreator(Protocol):
 SUPPORTED_CACHE_MANAGER = Registry[CacheManagerCreator]("Cache Manager")
 
 
+def hybrid_cache_sizing(
+    model_config: ModelConfig,
+    *,
+    page_size: int,
+    num_req_slots: int,
+    scratch_rows: int,
+) -> tuple[int, int] | None:
+    """(bytes per page, fixed bytes) for models with non-MHA caches, else None."""
+    if getattr(model_config, "is_deepseek_v4", False):
+        from .dsv4_pool import DSV4CacheSpec
+
+        spec = DSV4CacheSpec.from_model_config(model_config)
+        per_page = int(spec.bytes_per_token() * page_size)
+        fixed = spec.bytes_per_request() * num_req_slots + spec.fixed_bytes(scratch_rows)
+        return per_page, fixed
+    if getattr(model_config, "is_kimi_k3", False):
+        from .kimi_pool import KimiCacheSpec
+
+        spec = KimiCacheSpec.from_model_config(model_config)
+        return int(spec.bytes_per_token() * page_size), spec.bytes_per_request() * num_req_slots
+    return None
+
+
 def create_kvcache_pool(
     model_config: ModelConfig,
     num_pages: int,
     page_size: int,
     dtype: torch.dtype,
     device: torch.device,
+    *,
+    num_req_slots: int | None = None,
+    scratch_rows: int | None = None,
 ) -> BaseKVCachePool:
-    from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
+    if getattr(model_config, "is_deepseek_v4", False):
+        from .dsv4_pool import DSV4KVPool
+
+        return DSV4KVPool(
+            model_config,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_req_slots=int(num_req_slots or 1),
+            scratch_rows=int(scratch_rows or 8192),
+            dtype=dtype,
+            device=device,
+        )
+    if getattr(model_config, "is_kimi_k3", False):
+        from .kimi_pool import KimiKVPool
+
+        return KimiKVPool(
+            model_config,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_req_slots=int(num_req_slots or 1),
+            device=device,
+        )
+
+    from .mha_pool import MHAKVCache
 
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,
@@ -64,6 +113,7 @@ def create_prefix_cache(device: torch.device, type: str) -> BasePrefixCache:
 
 __all__ = [
     "create_kvcache_pool",
+    "hybrid_cache_sizing",
     "create_prefix_cache",
     "BaseKVCachePool",
     "BaseCacheHandle",

@@ -74,10 +74,13 @@ class ModelConfig:
 
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
-        model_type = getattr(config, "model_type", "")
-        if model_type == "deepseek_v4":
+        model_type = getattr(config, "model_type", "") or ""
+        archs = list(getattr(config, "architectures", None) or [])
+        if model_type == "deepseek_v4" or "DeepseekV4ForCausalLM" in archs:
             return _deepseek_v4_from_hf(cls, config)
-        if model_type in ("kimi_k3", "kimi_linear"):
+        if model_type in ("kimi_k3", "kimi_linear") or any(
+            a in ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM") for a in archs
+        ):
             return _kimi_k3_from_hf(cls, config)
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config

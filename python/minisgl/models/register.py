@@ -9,6 +9,9 @@ _MODEL_REGISTRY = {
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
     "MiniMaxM2ForCausalLM": (".minimax_m2", "MiniMaxM2ForCausalLM"),
     "Glm4MoeForCausalLM": (".glm4_moe", "Glm4MoeForCausalLM"),
+    "DeepseekV4ForCausalLM": (".deepseek_v4", "DeepseekV4ForCausalLM"),
+    "KimiK3ForConditionalGeneration": (".kimi_k3", "KimiK3ForCausalLM"),
+    "KimiLinearForCausalLM": (".kimi_k3", "KimiK3ForCausalLM"),
     "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
     "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
 }
