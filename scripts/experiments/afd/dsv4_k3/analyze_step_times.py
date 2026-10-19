@@ -31,23 +31,37 @@ def load_events(paths):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True, help="coordinator *_nvtx_cpu.json (glob ok)")
+    ap.add_argument("--ag-trace", default="", help="fallback: attention worker *_nvtx_cpu.json (glob ok)")
     ap.add_argument("--sweep", required=True)
     ap.add_argument("--skip", type=int, default=3)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    paths = sorted(glob.glob(args.trace))
-    if not paths:
-        raise SystemExit(f"no trace matches {args.trace}")
-    events = [
-        e for e in load_events(paths)
-        if str(e.get("name", "")).startswith("AFD_Coordinator_ScheduleDps")
-    ]
-    events.sort(key=lambda e: e["start_time_ns"])
     sweep = json.load(open(args.sweep))
+    paths = sorted(glob.glob(args.trace))
+    source = "coordinator"
+    if paths:
+        events = [
+            e for e in load_events(paths)
+            if str(e.get("name", "")).startswith("AFD_Coordinator_ScheduleDps")
+        ]
+    else:
+        # Fallback: one attention worker's per-step materialize events. Prefill
+        # is scheduled first, so the last (max_tokens - 1) steps of each batch
+        # run are its decode steps.
+        ag = sorted(glob.glob(args.ag_trace)) if args.ag_trace else []
+        if not ag:
+            raise SystemExit(f"no trace matches {args.trace} (and no --ag-trace)")
+        events = [e for e in load_events(ag[:1]) if str(e.get("name", "")).startswith("AFD_AG_Materialize")]
+        source = "attention-worker"
+    events.sort(key=lambda e: e["start_time_ns"])
     rows = []
     for run in sweep["runs"]:
         t0, t1 = run["start"] * 1e9, run["end"] * 1e9
-        dec = [e for e in events if t0 <= e["start_time_ns"] <= t1 and e.get("fields", {}).get("phase") == "decode"]
+        win = [e for e in events if t0 <= e["start_time_ns"] <= t1]
+        if source == "coordinator":
+            dec = [e for e in win if e.get("fields", {}).get("phase") == "decode"]
+        else:
+            dec = win[-max(1, int(sweep.get("max_tokens", 2)) - 1):]
         starts = [e["start_time_ns"] for e in dec]
         deltas = [(b - a) / 1e6 for a, b in zip(starts, starts[1:])]
         core = deltas[args.skip : len(deltas) - args.skip] if len(deltas) > 2 * args.skip + 2 else deltas
@@ -60,6 +74,7 @@ def main():
             "step_ms_min": min(core) if core else None,
             "step_ms_max": max(core) if core else None,
             "samples": len(core),
+            "source": source,
         }
         if row["step_ms_median"]:
             row["tokens_per_s_per_attn_gpu"] = run["per_attn_gpu_bs"] / (row["step_ms_median"] / 1e3)

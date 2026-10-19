@@ -92,7 +92,7 @@ RAY_DEDUP_LOGS=0 "$REPO_ROOT/scripts/serve/fastafd_server.sh" \
 SERVER_PID=$!
 stop_server() {
   kill -TERM "$SERVER_PID" 2>/dev/null || true
-  for _ in $(seq 1 45); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
+  for _ in $(seq 1 90); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
   kill -KILL "$SERVER_PID" 2>/dev/null || true
 }
 trap stop_server EXIT
@@ -125,4 +125,5 @@ stop_server
 trap - EXIT
 
 python "$SCRIPT_DIR/analyze_step_times.py" --trace "$RUN_DIR/ray_logs/*coordinator*_nvtx_cpu.json" \
+  --ag-trace "$RUN_DIR/ray_logs/attention_dp0_rank0_nvtx_cpu.json" \
   --sweep "$RUN_DIR/sweep.json" --out "$RUN_DIR/step_times.json" | tee "$RUN_DIR/step_times.log"
