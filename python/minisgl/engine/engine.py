@@ -384,7 +384,7 @@ class Engine:
             num_pages = available_memory // cache_per_page
             if hybrid is not None:  # no more KV than all request slots at full length need
                 need = (config.max_running_req + 1) * int(config.max_seq_len)
-                num_pages = min(num_pages, (need + config.page_size - 1) // config.page_size + 1)
+                num_pages = min(num_pages, 2 * ((need + config.page_size - 1) // config.page_size) + 64)
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
         num_tokens = num_pages * config.page_size

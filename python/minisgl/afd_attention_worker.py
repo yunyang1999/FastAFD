@@ -168,7 +168,7 @@ class AfdAttentionState:
             # tokens): never allocate more than every request slot at full
             # length could use, which keeps the page bookkeeping small.
             need = (config.max_running_req + 1) * int(config.max_seq_len)
-            memory_cap = min(memory_cap, (need + config.page_size - 1) // config.page_size + 1)
+            memory_cap = min(memory_cap, 2 * ((need + config.page_size - 1) // config.page_size) + 64)
         requested = config.num_page_override
         if requested is None:
             num_pages = memory_cap
