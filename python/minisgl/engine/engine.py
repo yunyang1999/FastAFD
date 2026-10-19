@@ -452,11 +452,12 @@ def _adjust_config(config: EngineConfig):
     forced = model_attention_backend(config.model_config)
     if forced is not None:
         backend, page_size = forced
+        # plain logger: AFD workers adjust the config before TP info exists
         if config.attention_backend not in ("auto", backend):
-            logger.warning_rank0(f"{config.model_config.arch} requires attention backend {backend}")
+            logger.warning(f"{config.model_config.arch} requires attention backend {backend}")
         override("attention_backend", backend)
         override("page_size", page_size)
-        logger.info_rank0(f"Model attention backend: {backend} page_size={page_size}")
+        logger.info(f"Model attention backend: {backend} page_size={page_size}")
 
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else "fi"

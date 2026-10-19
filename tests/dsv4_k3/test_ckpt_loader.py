@@ -264,7 +264,10 @@ def meta_model(path: str, device, *, stage: bool = False):
     from minisgl.models.config import ModelConfig
     from minisgl.utils import cached_load_hf_config, torch_dtype
 
-    set_tp_info(0, 1)
+    from minisgl.distributed import try_get_tp_info
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
     set_rope_device(device)
     mc = ModelConfig.from_hf(cached_load_hf_config(path))
     with torch.device("meta"), torch_dtype(torch.bfloat16):
@@ -378,12 +381,21 @@ def real_dir(model_name: str, shards: str) -> tuple[str, dict]:
     return path, lmap
 
 
-def real(model_name: str, shards: str, device, args) -> None:
+def real(model_name: str, shards: str, args) -> None:
+    path, lmap = real_dir(model_name, shards)
+    if args.forward:
+        real_forward(model_name, path, args)
+    else:
+        real_inspect(model_name, path, lmap)
+
+
+def real_inspect(model_name: str, path: str, lmap: dict) -> None:
     from minisgl.models.afd_hybrid import hybrid_afd_spec
     from minisgl.models.ckpt_loaders import expert_layer_weights, load_hybrid_checkpoint
     from minisgl.models.moe_common import dequant_mxfp4
 
-    path, lmap = real_dir(model_name, shards)
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
     model, mc = meta_model(path, device)
     S = load_hybrid_checkpoint(model, path, device)
     print(f"loaded {len(S)} tensors, {sum(t.numel() * t.element_size() for t in S.values()) / 2**30:.2f} GiB", flush=True)
@@ -413,11 +425,14 @@ def real(model_name: str, shards: str, device, args) -> None:
         check(ok, f"{model_name} real layer {layer} (ckpt {lmap.get(layer, layer)}): expert rank 1/{eg_size} slice matches colocated load")
         if spec.shared_experts_per_rank:
             check(w13.shape[0] == n + 1, f"{model_name} real layer {layer}: MXFP4 shared slot appended")
-    del S, model
-    torch.cuda.empty_cache()
-    if args.no_forward:
-        return
-    # engine forward on real weights vs the torch reference on the same weights
+
+
+def real_forward(model_name: str, path: str, args) -> None:
+    """Engine (real weights through the loader) vs the torch reference."""
+    from minisgl.models.config import ModelConfig
+    from minisgl.utils import cached_load_hf_config
+
+    mc = ModelConfig.from_hf(cached_load_hf_config(path))
     os.environ["MINISGL_MOE_EXEC"] = "torch"
     import test_numerics as tn
     from harness import EngineDriver
@@ -471,14 +486,14 @@ def main():
     ap.add_argument("--shards", default="")
     ap.add_argument("--len", type=int, default=64)
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument("--no-forward", action="store_true")
+    ap.add_argument("--forward", action="store_true", help="real: engine forward vs reference (separate process)")
     args = ap.parse_args()
-    device = torch.device("cuda", 0)
-    torch.cuda.set_device(device)
     if args.mode == "roundtrip":
+        device = torch.device("cuda", 0)
+        torch.cuda.set_device(device)
         roundtrip(args.model, device)
     else:
-        real(args.model, args.shards, device, args)
+        real(args.model, args.shards, args)
     print(f"CKPT LOADER {'FAILED (' + str(len(FAILS)) + ')' if FAILS else 'OK'}", flush=True)
     sys.exit(1 if FAILS else 0)
 
