@@ -20,7 +20,7 @@ import urllib.request
 def build_prompt(tokenizer_dir: str, target: int) -> str:
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir)  # no checkpoint remote code
     unit = " hello"
     lo, hi = 1, max(target * 2, 16)
     while len(tok.encode((unit * hi).strip())) <= target:
