@@ -135,6 +135,13 @@ Deviations / limits (current state):
 * Prefix caching is not supported (`--cache-type naive`).
 * K3 tokenizer needs `tiktoken`, which the `minisgl-cuda130` env lacks; dummy
   runs set `MINISGL_TOKENIZER_PATH` to another tokenizer directory.
+* Multi-node AFD runs can hit the intermittent MegaMoE M2N cross-node
+  `DeepGEMM NVLink barrier timeout (300s)` (the "bug 5" seen with the other
+  models' e2e runs): some ranks never observe the remote signals and every
+  worker traps after 300 s. The bench runner detects it and the case can be
+  retried; sweeps run one server per batch size to bound the loss.
+* Dummy weights + greedy decoding collapse onto a single token (and thus onto
+  one set of experts); the sweep client samples (temperature 1) instead.
 
 ## 7. How to run
 
