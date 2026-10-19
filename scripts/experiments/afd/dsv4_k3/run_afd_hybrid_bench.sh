@@ -93,7 +93,7 @@ RAY_DEDUP_LOGS=0 "$REPO_ROOT/scripts/serve/fastafd_server.sh" \
 SERVER_PID=$!
 stop_server() {
   kill -TERM "$SERVER_PID" 2>/dev/null || true
-  for _ in $(seq 1 90); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
+  for _ in $(seq 1 30); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
   kill -KILL "$SERVER_PID" 2>/dev/null || true
 }
 trap stop_server EXIT
