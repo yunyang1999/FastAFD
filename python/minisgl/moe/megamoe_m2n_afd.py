@@ -391,6 +391,40 @@ class MegaMoEM2NAfdAdapter:
         l1_t, l2_t = _mm.transform_weights_for_mega_moe(l1, l2)
         self._register_transformed_eg_layer_weights(layer_id, l1_t, l2_t)
 
+    def register_eg_layer_fp4_packed_weights(
+        self,
+        layer_id: int,
+        w13: torch.Tensor,
+        w13_sf: torch.Tensor,
+        w2: torch.Tensor,
+        w2_sf: torch.Tensor,
+    ) -> None:
+        """Register already-quantised MXFP4 expert weights (checkpoint layout).
+
+        ``w13`` uint8 [E_local(+shared), 2*I, H/2] (gate rows then up rows, E2M1
+        codes, low nibble = even element), ``w13_sf`` uint8 [.., 2*I, H/32] UE8M0
+        exponents; ``w2``/``w2_sf`` likewise with [.., H, I/2] / [.., H, I/32].
+        The replicated shared expert, when enabled, is the last slot.
+        """
+        if not self.is_eg:
+            raise RuntimeError("register_eg_layer_fp4_packed_weights called on an AG rank")
+        if self.use_fp8_weights:
+            raise RuntimeError("packed FP4 weights require weight_precision='fp4'")
+        n_local = self.num_experts // self.eg_size
+        expect = {
+            "w13": (n_local, 2 * self.intermediate_size, self.hidden_size // 2),
+            "w13_sf": (n_local, 2 * self.intermediate_size, self.hidden_size // 32),
+            "w2": (n_local, self.hidden_size, self.intermediate_size // 2),
+            "w2_sf": (n_local, self.hidden_size, self.intermediate_size // 32),
+        }
+        for name, t in (("w13", w13), ("w13_sf", w13_sf), ("w2", w2), ("w2_sf", w2_sf)):
+            if tuple(t.shape) != expect[name] or t.dtype != torch.uint8:
+                raise RuntimeError(f"{name}: got {tuple(t.shape)} {t.dtype}, expected {expect[name]} uint8")
+        from minisgl.models.moe_common import to_megamoe_weights
+
+        l1_t, l2_t = to_megamoe_weights(w13, w13_sf, w2, w2_sf)
+        self._register_transformed_eg_layer_weights(layer_id, l1_t, l2_t)
+
     def _register_transformed_eg_layer_weights(
         self,
         layer_id: int,
