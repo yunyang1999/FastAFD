@@ -49,6 +49,9 @@ def main():
     ap.add_argument("--prompt-len", type=int, default=1024)
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--timeout", type=float, default=7200)
+    # sampled decoding keeps dummy-weight models from collapsing onto one token
+    # (which would also collapse MoE routing, unlike real traffic)
+    ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     prompt = build_prompt(args.tokenizer, args.prompt_len)
@@ -59,7 +62,8 @@ def main():
         res = post(
             f"{args.url}/v1/chat/completions/batch",
             {"model": "m", "prompts": [prompt] * n, "max_tokens": args.max_tokens, "ignore_eos": True,
-             "temperature": 0.0, "top_k": 1, "return_token_ids": True},
+             "temperature": args.temperature, "top_k": 1 if args.temperature == 0 else -1,
+             "return_token_ids": True},
             args.timeout,
         )
         t1 = time.time()

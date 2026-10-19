@@ -35,8 +35,9 @@ if [[ -z "${AFD_DECODE_GRAPH_BS:-}" ]]; then
 bs=[int(x) for x in '$BATCH_SIZES'.split(',')]; mb=$AFD_NUM_MB
 print(','.join(str(v) for v in sorted({max(1,(b+mb-1)//mb) for b in bs})))")
 fi
-MAX_RUNNING=$(( MAX_BS ))
+# --afd-max-running-requests is global (split evenly over the attention DP ranks)
 NUM_REQ_TOTAL=$(( MAX_BS * AFD_ATTN_DP_SIZE ))
+MAX_RUNNING=$NUM_REQ_TOTAL
 
 ARCH=$(python -c "import json;c=json.load(open('$MODEL_PATH/config.json'));print(c.get('model_type',''))")
 case "$ARCH" in
