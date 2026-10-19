@@ -5,6 +5,7 @@ from typing import Any
 
 import ray
 
+from minisgl.models.afd_hybrid import is_hybrid_model_path
 from minisgl.env import afd_env
 from minisgl.server.supervisor_ray import _build_ray_nsight_options
 
@@ -190,7 +191,9 @@ def startup_afd_workers(coord: Any) -> None:
                 "node_ip": attn_rank_node,
                 "max_extend_tokens": coord.max_batched_tokens,
                 "max_running_req": coord.attn_max_running_req,
-                "use_dummy_weight": False,
+                # legacy AG stages always load real weights; DSV4/K3 honour --dummy-weight
+                "use_dummy_weight": bool(coord.server_args.use_dummy_weight)
+                and is_hybrid_model_path(coord.server_args.model_path),
             }
             worker_kwargs.update(_afd_union_dist_kwargs(global_rank))
             coord.attn_workers.append(

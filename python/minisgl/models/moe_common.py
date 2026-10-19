@@ -55,6 +55,14 @@ def dequant_mxfp4(packed: torch.Tensor, sf: torch.Tensor, dtype=torch.bfloat16) 
     return (vals * scale).to(dtype)
 
 
+def _dequant_experts(packed: torch.Tensor, sf: torch.Tensor, chunk: int = 8) -> torch.Tensor:
+    """dequant_mxfp4 over [E, N, K/2] in expert chunks (bounded fp32 temporaries)."""
+    out = torch.empty(*packed.shape[:-1], packed.shape[-1] * 2, dtype=torch.bfloat16, device=packed.device)
+    for e in range(0, packed.shape[0], chunk):
+        out[e : e + chunk] = dequant_mxfp4(packed[e : e + chunk], sf[e : e + chunk])
+    return out
+
+
 def quant_mxfp4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """[..., N, K] float -> (packed uint8 [..., N, K/2], sf uint8 [..., N, K/32]).
 
@@ -162,7 +170,7 @@ class FP4RoutedExperts(BaseOP):
 
     def bf16(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._bf16_cache is None:
-            self._bf16_cache = (dequant_mxfp4(self.w13, self.w13_sf), dequant_mxfp4(self.w2, self.w2_sf))
+            self._bf16_cache = (_dequant_experts(self.w13, self.w13_sf), _dequant_experts(self.w2, self.w2_sf))
         return self._bf16_cache
 
     def megamoe(self, extra: tuple[torch.Tensor, ...] | None = None):

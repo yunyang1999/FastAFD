@@ -111,6 +111,19 @@ def hybrid_afd_spec(mc) -> HybridAfdSpec | None:
     )
 
 
+def is_hybrid_model_path(model_path: str) -> bool:
+    """True for checkpoints served by the DSV4 / K3 AFD path."""
+    from minisgl.utils import cached_load_hf_config
+
+    from .config import ModelConfig
+
+    try:
+        mc = ModelConfig.from_hf(cached_load_hf_config(model_path))
+    except Exception:
+        return False
+    return bool(getattr(mc, "is_deepseek_v4", False) or getattr(mc, "is_kimi_k3", False))
+
+
 def attention_stage_class(mc):
     if mc.is_deepseek_v4:
         from .deepseek_v4_afd import DeepseekV4AfdAttention
@@ -134,4 +147,4 @@ def dummy_eg_layer_weights(spec: HybridAfdSpec, eg_rank: int, eg_size: int, laye
     return w13, s13, w2, s2
 
 
-__all__ = ["HybridAfdSpec", "hybrid_afd_spec", "attention_stage_class", "dummy_eg_layer_weights"]
+__all__ = ["HybridAfdSpec", "hybrid_afd_spec", "is_hybrid_model_path", "attention_stage_class", "dummy_eg_layer_weights"]
