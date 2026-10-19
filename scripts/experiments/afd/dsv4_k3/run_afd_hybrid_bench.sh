@@ -100,6 +100,10 @@ trap stop_server EXIT
 deadline=$((SECONDS + ${WAIT_READY_TIMEOUT:-3600}))
 until curl -fsS "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "server exited" >&2; tail -80 "$RUN_DIR/afd.log" >&2; exit 2; fi
+  if grep -qs "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log; then
+    echo "worker failure during startup:" >&2; grep -hs -A3 "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log | tail -20 >&2
+    exit 3
+  fi
   if (( SECONDS > deadline )); then echo "server not ready" >&2; tail -80 "$RUN_DIR/afd.log" >&2; exit 1; fi
   sleep 5
 done
