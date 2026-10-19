@@ -56,6 +56,7 @@ _RUNTIME_ENV_KEYS = (
     "MINISGL_NVTX_CPU_TRACE",
     # DeepSeek-V4 / Kimi-K3 bring-up knobs (read inside the Ray workers)
     "MINISGL_AFD_MEGAMOE_PROFILE",
+    "MINISGL_CKPT_LAYER_MAP",
     "MINISGL_KDA_STATE_DTYPE",
     "MINISGL_MOE_EXEC",
     "MINISGL_ROPE_TABLE_LEN",

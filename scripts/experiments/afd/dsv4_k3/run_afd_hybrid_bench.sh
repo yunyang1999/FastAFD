@@ -105,6 +105,14 @@ until curl -fsS "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; do
 done
 echo "server ready after ${SECONDS}s"
 
+if [[ -n "${GREEDY_OUT:-}" ]]; then  # fixed-prompt greedy tokens instead of the sweep
+  python "$SCRIPT_DIR/greedy_tokens.py" run --url "http://127.0.0.1:$PORT" --max-tokens "$MAX_TOKENS" --out "$GREEDY_OUT"
+  rc=$?
+  stop_server
+  trap - EXIT
+  exit $rc
+fi
+
 python "$SCRIPT_DIR/bench_client.py" --url "http://127.0.0.1:$PORT" \
   --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --attn-dp "$AFD_ATTN_DP_SIZE" \
   --batch-sizes "$BATCH_SIZES" --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
