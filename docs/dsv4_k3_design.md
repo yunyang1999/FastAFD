@@ -179,3 +179,23 @@ sbatch -N 9 --segment=9 --account=<acct> --partition=<gb200 partition> --time=03
 
 `LAYERS=4` gives the reduced-depth variant; `MODEL_DIR_<model>=<checkpoint>` with
 `DUMMY_WEIGHT=0` serves real weights.
+
+## 8. Validation summary (dummy weights unless noted)
+
+* Kernels (`tests/dsv4_k3/test_kernels.py`): 23/23 checks against torch
+  references (mHC, q/kv norm+RoPE+quant simulation, inverse RoPE, compressor
+  decode, short conv, KDA recurrence, gated RMSNorm, attention residuals, SiTU).
+* Module / full-forward numerics (`tests/dsv4_k3/test_numerics.py`, 4 layers, BF16
+  non-expert weights, torch MoE executor, prompts of 9/150/300 tokens + 4 decode
+  steps, against torch transcriptions of the official references): attention
+  modules rel-L2 4-6e-3 (DSV4 SWA/C4/C128, K3 MLA), KDA 3e-4-2e-3, MoE / LatentMoE
+  2-5e-3; full-forward logits 0.5-2.2e-2 with the reference forced onto the
+  engine's routed-expert ids. Without forcing, single prompts can differ by up to
+  ~0.4 rel-L2 because random routers produce top-k near-ties (K3 routing-set
+  agreement 0.54-0.97 over 300 tokens); CUDA-graph decode equals eager decode
+  bit for bit.
+* Real weights (truncated depth, `tests/dsv4_k3/test_ckpt_loader.py real`):
+  DSV4-Flash layers {0, 2, 3} + embed/head: logits rel-L2 1.8-2.4e-2 vs the
+  reference (FP8 W8A8 GEMMs in the engine); Kimi-K3 layers {0, 3} + embed/head:
+  6.4-6.9e-3, argmax agreement 1.0. Loader round trip is bit-exact for the
+  colocated models, the AFD attention stages and the expert-worker slices.
