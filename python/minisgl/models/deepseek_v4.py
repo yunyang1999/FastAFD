@@ -676,6 +676,19 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def post_load(self, *, max_tokens_per_rank: int) -> None:
         """Build the colocated MoE executor (MegaMoE) after weights are loaded."""
         args = self.model._args
+        if os.environ.get("MINISGL_DSV4_SHARED_MXFP4", "0") == "1":
+            # Emulate the AFD placement, where the shared expert runs inside the
+            # MegaMoE stage with MXFP4 weights (re-quantised from FP8).
+            from .moe_common import dequant_mxfp4
+
+            for layer in self.model.layers.op_list:
+                sh = layer.ffn.shared_experts
+                if sh is None:
+                    continue
+                p13, s13, p2, s2 = sh.as_mxfp4()
+                for lin, (p, sf) in ((sh.gate_up, (p13[0], s13[0])), (sh.down, (p2[0], s2[0]))):
+                    lin._bf16_weight = dequant_mxfp4(p, sf)
+                    lin._use_bf16_cublas_for_fp8 = True
         if moe_exec_backend() == "megamoe":
             self._executor = ColocatedMegaMoE(
                 num_routed=args.n_routed,
