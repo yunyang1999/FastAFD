@@ -13,6 +13,8 @@ mtp_nextn=${MTP_NEXTN:-0}
 microbatches=${MICROBATCHES:-2}
 layers=${LAYERS:-0}
 routing=${ROUTING:-balanced}
+hot_expert_fraction=${HOT_EXPERT_FRACTION:-}
+replay_distribution=${REPLAY_DISTRIBUTION:-}
 backend=${BACKEND:-mega}
 weight_slots=${WEIGHT_SLOTS:-0}
 expected_tokens_per_lane=${EXPECTED_TOKENS_PER_LANE:-}
@@ -40,7 +42,7 @@ if [[ ${backend} == deepep ]]; then
   export EP_DISABLE_GIN=${EP_DISABLE_GIN:-1}
 fi
 
-suffix="${model}_${backend}_${ag_size}a${eg_size}f_s${sequences_per_ag_rank}_n${mtp_nextn}_mb${microbatches}_${routing}"
+suffix="${model}_${backend}_${ag_size}a${eg_size}f_s${sequences_per_ag_rank}_n${mtp_nextn}_mb${microbatches}_${routing}${hot_expert_fraction:+f${hot_expert_fraction}}"
 args=(
   --model "${model}"
   --output "${results_dir}/${suffix}.json"
@@ -57,10 +59,20 @@ args=(
   --warmups "${warmups}"
   --iterations "${iterations}"
 )
+if [[ -n "${hot_expert_fraction}" ]]; then
+  args+=(--hot-expert-fraction "${hot_expert_fraction}")
+fi
+if [[ -n "${replay_distribution}" ]]; then
+  args+=(--replay-distribution "${replay_distribution}")
+fi
 if [[ -n "${expected_tokens_per_lane}" ]]; then
   args+=(--expected-tokens-per-lane "${expected_tokens_per_lane}")
 fi
 
-torchrun --standalone --nproc-per-node="$((ag_size + eg_size))" \
+# shellcheck source=./_torchrun_launch.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_torchrun_launch.sh"
+megamoe_torchrun_cmd "$((ag_size + eg_size))" "${suffix}"
+
+"${MEGAMOE_LAUNCH[@]}" \
   "${fastafd_root}/scripts/experiments/afd/benchmark_megamoe_m2n_models.py" \
   "${args[@]}"

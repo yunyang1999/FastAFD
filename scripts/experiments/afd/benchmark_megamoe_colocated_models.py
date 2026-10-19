@@ -199,6 +199,36 @@ def gpu_provenance(local_rank: int) -> dict[str, Any]:
     }
 
 
+_REPLAY_WEIGHTS: torch.Tensor | None = None
+
+
+def load_replay_distribution(path: str, num_experts: int) -> torch.Tensor:
+    """Per-expert selection weights from a recorded serving run.
+
+    Same contract as the split benchmark's loader: only the SHAPE of the
+    recorded skew transfers, since this benchmark sets its own token count.
+    """
+    global _REPLAY_WEIGHTS
+    with open(path) as fh:
+        payload = json.load(fh)
+    counts = payload.get("counts_total")
+    if not counts:
+        raise SystemExit(f"{path}: no counts_total")
+    if len(counts) != num_experts:
+        raise SystemExit(
+            f"{path}: recorded {len(counts)} experts, profile has {num_experts}"
+        )
+    w = torch.tensor(counts, dtype=torch.float64)
+    if float(w.sum()) <= 0:
+        raise SystemExit(f"{path}: counts_total sums to zero")
+    # CPU here, device chosen at sample time. This loader runs during argument
+    # handling, BEFORE torch.cuda.set_device(local_rank), so ".to('cuda')" would
+    # resolve to cuda:0 for every rank and hand a cuda:0 tensor to a rank living
+    # on cuda:3. Same defect, same fix, as the split benchmark.
+    _REPLAY_WEIGHTS = (w / w.sum()).cpu()
+    return _REPLAY_WEIGHTS
+
+
 def protocol_shape(profile: MegaMoEModelProfile, ep_size: int) -> tuple[int, int, int]:
     profile.validate(eg_size=ep_size)
     local_routed = profile.num_routed_experts // ep_size
@@ -224,7 +254,24 @@ def make_protocol_routes(
         )
     token_ids = torch.arange(tokens, dtype=torch.int64, device="cuda") + rank * tokens
     offsets = torch.arange(profile.routed_top_k, dtype=torch.int64, device="cuda")
-    real_ids = (token_ids[:, None] * profile.routed_top_k + offsets[None, :]) % active_experts
+    if routing == "replay":
+        # Recorded real-router distribution. Deterministic per rank so repeats of
+        # a configuration are identical, and without replacement so a token
+        # cannot select the same expert twice -- see the split benchmark.
+        if _REPLAY_WEIGHTS is None:
+            raise SystemExit("routing=replay requires --replay-distribution")
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(0x5EED0000 + rank * 4096)
+        probs = _REPLAY_WEIGHTS.to(device=offsets.device, dtype=torch.float32).expand(
+            tokens, -1
+        )
+        real_ids = torch.multinomial(
+            probs, profile.routed_top_k, replacement=False, generator=gen
+        )
+    else:
+        real_ids = (
+            token_ids[:, None] * profile.routed_top_k + offsets[None, :]
+        ) % active_experts
     owner = torch.div(real_ids, local_routed, rounding_mode="floor")
     local_id = real_ids.remainder(local_routed)
     protocol_ids = owner * (local_routed + profile.num_shared_experts) + local_id
@@ -566,7 +613,14 @@ def main() -> None:
     parser.add_argument("--tokens-per-rank", type=int, required=True)
     parser.add_argument("--mtp-nextn", type=int, default=0)
     parser.add_argument("--layers", type=int, default=0, help="0 means all model MoE layers")
-    parser.add_argument("--routing", choices=("balanced", "hotset"), default="balanced")
+    parser.add_argument(
+        "--routing", choices=("balanced", "hotset", "replay"), default="balanced"
+    )
+    parser.add_argument(
+        "--replay-distribution",
+        default=None,
+        help="expert_load JSON from a real serving run; required for --routing replay",
+    )
     parser.add_argument("--hot-expert-fraction", type=float, default=0.25)
     parser.add_argument(
         "--backend",
@@ -604,6 +658,15 @@ def main() -> None:
         raise SystemExit("tokens-per-rank must be positive")
     if args.mtp_nextn < 0:
         raise SystemExit("mtp-nextn must be non-negative")
+    if args.routing == "replay" and not args.replay_distribution:
+        raise SystemExit("--routing replay requires --replay-distribution")
+    if args.routing == "replay":
+        # The loader was defined here but never called, so --replay-distribution
+        # parsed cleanly and then every rank hit the sampler with _REPLAY_WEIGHTS
+        # still None. The split benchmark calls it; this one did not.
+        load_replay_distribution(args.replay_distribution, profile.num_routed_experts)
+    if args.replay_distribution and args.routing != "replay":
+        raise SystemExit("--replay-distribution is only meaningful with --routing replay")
     if not 0 < args.hot_expert_fraction <= 1:
         raise SystemExit("hot-expert-fraction must be in (0, 1]")
     if args.weight_slots < 1:
@@ -961,6 +1024,7 @@ def main() -> None:
                 ),
                 "routing": args.routing,
                 "hot_expert_fraction": args.hot_expert_fraction,
+                "replay_distribution": args.replay_distribution,
                 "routing_load": route_summary(route_counts.cpu()),
                 "input_policy": (
                     "fixed deterministic representative hidden state reused independently "

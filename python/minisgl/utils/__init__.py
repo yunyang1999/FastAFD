@@ -6,6 +6,7 @@ from .cpu_trace import (
     parse_step_id_from_nvtx_name,
     shutdown_nvtx_cpu_trace,
 )
+from . import expert_load
 from .hf import cached_load_hf_config, download_hf_weight, load_tokenizer
 from .logger import init_logger
 from .misc import UNSET, Unset, align_down, call_if_main, div_ceil, div_even
@@ -22,6 +23,7 @@ from .registry import Registry
 from .torch_utils import nvtx_annotate, nvtx_label, nvtx_range, torch_dtype
 
 __all__ = [
+    "expert_load",
     "cached_load_hf_config",
     "download_hf_weight",
     "load_tokenizer",

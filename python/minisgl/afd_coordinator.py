@@ -202,7 +202,12 @@ class AfdCoordinator:
         self._cpu_trace_path = init_nvtx_cpu_trace(
             output_dir=self.report_dir,
             process_label="coordinator",
-            enabled=bool(server_args.ray_nsys),
+            # `ray_nsys=True` also requires a real `nsys` binary elsewhere
+            # (supervisor_afd.py's driver check, Ray's nsight actor-wrap
+            # options) -- pass None instead of False so a missing/unwanted
+            # nsys install doesn't block this independent, pure-Python
+            # per-step JSON trace; falls back to MINISGL_NVTX_CPU_TRACE.
+            enabled=(True if server_args.ray_nsys else None),
             metadata={
                 "kind": "afd-coordinator",
                 "ray_nsys": bool(server_args.ray_nsys),

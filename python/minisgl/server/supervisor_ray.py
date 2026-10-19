@@ -42,6 +42,10 @@ _RAY_ENV_KEYS = (
     "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
     "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
     "MINISGL_NVTX_CPU_TRACE",
+    # Second allowlist. afd_support._RUNTIME_ENV_KEYS is NOT enough: a var
+    # has to clear both to reach a worker, and missing either one fails
+    # silently -- the run succeeds and simply records nothing.
+    "MINISGL_DUMP_EXPERT_LOAD",
     "NSYS",
     "NCCL_DEBUG",
     "NCCL_DEBUG_SUBSYS",

@@ -11,6 +11,8 @@ tokens_per_rank=${TOKENS_PER_RANK:-64}
 mtp_nextn=${MTP_NEXTN:-0}
 layers=${LAYERS:-0}
 routing=${ROUTING:-balanced}
+hot_expert_fraction=${HOT_EXPERT_FRACTION:-}
+replay_distribution=${REPLAY_DISTRIBUTION:-}
 backend=${BACKEND:-mega}
 measurement_order=${MEASUREMENT_ORDER:-grouped}
 weight_slots=${WEIGHT_SLOTS:-2}
@@ -29,7 +31,19 @@ export PYTHONPATH="${workspace}/python_deps:${sglang_python_root}:${fastafd_root
 export MEASUREMENT_CONTAINER_IMAGE=${MEASUREMENT_CONTAINER_IMAGE:-unknown}
 
 suffix="${model}_${ep_size}ep_t${tokens_per_rank}_n${mtp_nextn}_${routing}_${backend}"
-torchrun --standalone --nproc-per-node="${ep_size}" \
+
+args=()
+if [[ -n "${hot_expert_fraction}" ]]; then
+  args+=(--hot-expert-fraction "${hot_expert_fraction}")
+fi
+if [[ -n "${replay_distribution}" ]]; then
+  args+=(--replay-distribution "${replay_distribution}")
+fi
+# shellcheck source=./_torchrun_launch.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_torchrun_launch.sh"
+megamoe_torchrun_cmd "${ep_size}" "${suffix}"
+
+"${MEGAMOE_LAUNCH[@]}" \
   "${fastafd_root}/scripts/experiments/afd/benchmark_megamoe_colocated_models.py" \
   --model "${model}" \
   --output "${results_dir}/${suffix}.json" \
@@ -42,4 +56,5 @@ torchrun --standalone --nproc-per-node="${ep_size}" \
   --measurement-order "${measurement_order}" \
   --weight-slots "${weight_slots}" \
   --warmups "${warmups}" \
-  --iterations "${iterations}"
+  --iterations "${iterations}" \
+  "${args[@]}"

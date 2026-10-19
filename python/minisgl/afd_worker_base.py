@@ -235,10 +235,20 @@ class BaseAfdWorker:
             trace_label = f"{role}_dp{self.attn_dp_rank}_rank{tp_rank}"
         else:
             trace_label = f"{role}_rank{tp_rank}"
+        self._cpu_trace_dir = log_dir
+        # Keep the disambiguated label: with attn_dp=12/tp=1 every attention
+        # worker has tp_rank == 0, so a "{role}_rank{tp_rank}" filename makes all
+        # 12 ranks write the SAME path on shared lustre. os.replace is atomic, so
+        # that does not corrupt anything -- it silently keeps one rank and drops
+        # eleven, which is the kind of loss that looks like a successful run.
+        self._trace_label = trace_label
         self._cpu_trace_path = init_nvtx_cpu_trace(
             output_dir=log_dir,
             process_label=trace_label,
-            enabled=bool(ray_nsys),
+            # See matching note in afd_coordinator.py -- None (not False)
+            # so a missing nsys binary can't block this independent trace;
+            # falls back to MINISGL_NVTX_CPU_TRACE.
+            enabled=(True if ray_nsys else None),
             metadata={
                 "kind": "afd-worker",
                 "role": role,
@@ -687,6 +697,30 @@ class BaseAfdWorker:
             else:
                 self._afd_eg_model = model
 
+        # Routing-distribution accumulator. Bound HERE and not in the graph
+        # runner: capture must not record (see the A/B note in
+        # afd_attention_worker), so a recording run has decode graphs DISABLED,
+        # and with them disabled the graph runner below is never constructed at
+        # all. Binding it there would mean the one configuration that can record
+        # is the one configuration where the accumulator does not exist.
+        #
+        # No-op unless MINISGL_DUMP_EXPERT_LOAD is set. num_experts is passed
+        # explicitly because the AFD model wrappers keep no .config, so probing
+        # would silently find nothing.
+        if self.role == "attention":
+            try:
+                from minisgl.utils import expert_load
+
+                if int(getattr(mc, "num_experts", 0) or 0) > 0:
+                    expert_load.init(
+                        num_layers=int(mc.num_layers),
+                        num_experts=int(mc.num_experts),
+                        device=self.device,
+                        label=f"{self.role}_rank{self.tp_rank}",
+                    )
+            except Exception:
+                pass
+
         # CUDA-graph decode runners (lockstep AG/EG). Built here; captured later
         # by warmup_afd_decode_graphs() once the coordinator drives all ranks
         # together (the per-layer dispatch/combine are collectives).
@@ -708,6 +742,7 @@ class BaseAfdWorker:
                     runtime=self.runtime,
                     num_layers=int(mc.num_layers),
                     hidden_size=int(mc.hidden_size),
+                    num_experts=int(getattr(mc, "num_experts", 0) or 0),
                     bs_list=tuple(self.decode_graph_bs),
                     log_path=self.log_path,
                     label=f"{self.role} rank={self.tp_rank}",
@@ -759,6 +794,21 @@ class BaseAfdWorker:
             f"[{self.role} rank={self.tp_rank}] afd_decode_graphs:captured {captured}",
             flush=True,
         )
+        # Warmup drove dummy capture batches through the router. Drop their
+        # routing now, before the coordinator sends the first real step -- see
+        # expert_load.reset for why this cannot be done by skipping instead.
+        try:
+            from minisgl.utils import expert_load
+
+            note = expert_load.reset()
+            if note:
+                log_line(
+                    self.log_path,
+                    f"[{self.role} rank={self.tp_rank}] expert_load reset: {note}",
+                    flush=True,
+                )
+        except Exception:
+            pass
         return {"role": self.role, "rank": self.tp_rank, "captured": captured}
 
     def _detach_nsys_injection_from_subprocesses(self) -> None:
@@ -934,6 +984,25 @@ class BaseAfdWorker:
             pass
         try:
             self.stop_cuda_profiler()
+        except Exception:
+            pass
+        # Real expert routing distribution, if it was being recorded. Written in
+        # the same teardown as the cpu_trace and for the same reason: this is the
+        # only point where a host sync is safe, and it must survive a multi-node
+        # teardown that would otherwise leave per-rank artifacts unwritten.
+        try:
+            from minisgl.utils import expert_load
+
+            load_path = expert_load.dump(
+                self._cpu_trace_dir,
+                self._trace_label,
+            )
+            if load_path:
+                log_line(
+                    self.log_path,
+                    f"[{self.role} rank={self.tp_rank}] expert_load written path={load_path}",
+                    flush=True,
+                )
         except Exception:
             pass
 

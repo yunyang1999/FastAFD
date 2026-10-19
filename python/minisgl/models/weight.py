@@ -98,6 +98,16 @@ def _shard_tensor(
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
     if skip_tp_shard:
         return value
+    if value.dim() == 0:
+        # A true scalar (e.g. a per-tensor FP8 weight_scale/input_scale, as
+        # in nvidia_qwen3-235b-a22b-fp8) is one global value, not a
+        # per-row/per-column quantity: every rank dequantizes its own weight
+        # shard with the SAME scale, so replicate rather than shard.
+        # `.chunk()` below raises "chunk expects at least a 1-dimensional
+        # tensor" on a 0-d input; `_shard_fp8_scale_tensor` only handles the
+        # block-wise scaling scheme (fp8_block_size is not None), so a
+        # scalar reaches the generic chunk() path and crashes with it.
+        return value
     if fp8_block_size is not None and (
         key.endswith(".weight_scale") or key.endswith(_SCALE_RENAME_SUFFIX)
     ):
@@ -209,6 +219,15 @@ def _find_paired_scale_key(
 
 def _get_merge_info(key: str):
     """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
+    # k_scale/v_scale are per-layer KV-cache quantization scales (vLLM-style
+    # naming: nvidia_qwen3-235b-a22b-fp8 stores them as
+    # `...k_proj.k_scale` / `...v_proj.v_scale`), unrelated to the q/k/v
+    # *weight* merge despite the `.k_proj`/`.v_proj` substring match below.
+    # Q has no `q_scale` counterpart (queries aren't cached), so routing
+    # these through the qkv merge group always leaves it one slot short and
+    # `load_weight` asserts "Incomplete merge groups in checkpoint".
+    if key.endswith(".k_scale") or key.endswith(".v_scale"):
+        return None
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
         if key.count(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
@@ -431,7 +450,17 @@ def load_weight(
                         continue
                     parts = [merge_buf[merged_key][s] for s in all_slots]
                     del merge_buf[merged_key]
-                    out = (merged_key, torch.cat(parts, dim=0))
+                    if parts[0].dim() == 0:
+                        # Per-tensor scalar scales (one per fused slot, e.g.
+                        # q/k/v each with their own weight_scale) have no row
+                        # dimension to concatenate along; stack them into a
+                        # length-len(all_slots) vector instead so each
+                        # component's scale is preserved. `torch.cat`
+                        # requires >=1-d inputs and raises "zero-dimensional
+                        # tensor ... cannot be concatenated" here otherwise.
+                        out = (merged_key, torch.stack(parts, dim=0))
+                    else:
+                        out = (merged_key, torch.cat(parts, dim=0))
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info

@@ -18,7 +18,7 @@ from minisgl.engine.config import EngineConfig
 from minisgl.engine.engine import _adjust_config, _init_tp_communication
 from minisgl.engine.graph import get_free_memory, mem_GB
 from minisgl.kvcache import create_kvcache_pool
-from minisgl.utils import div_even, init_logger, nvtx_label, nvtx_range
+from minisgl.utils import div_even, expert_load, init_logger, nvtx_label, nvtx_range
 
 from .afd_attention_runtime import AfdAttentionRuntime
 from .afd_protocol import (
@@ -279,6 +279,7 @@ class AfdAgDecodeGraphRunner:
         bs_list: tuple[int, ...],
         log_path: str,
         label: str,
+        num_experts: int = 0,
     ) -> None:
         self.state = runtime_state
         self.model = model
@@ -298,6 +299,17 @@ class AfdAgDecodeGraphRunner:
         self.device = runtime_state.device
         self.num_layers = int(num_layers)
         self.hidden_size = int(hidden_size)
+        # No-op unless MINISGL_DUMP_EXPERT_LOAD is set. num_experts is passed in
+        # rather than probed off the model: the AFD model wrappers do not keep a
+        # .config (Qwen3AfdDenseRouterForCausalLM holds only .model/.lm_head), so
+        # attribute probing would silently find nothing and record an empty run.
+        if int(num_experts or 0) > 0:
+            expert_load.init(
+                num_layers=self.num_layers,
+                num_experts=int(num_experts),
+                device=self.device,
+                label=str(label),
+            )
         # decode_graph_bs entries are PER-MB sizes (the coordinator pads a decode
         # batch to padded_per_mb * num_mb). For num_mb==1 per-MB == total. The
         # graphs dict is keyed by the TOTAL bs (== runtime len(padded_reqs)).
@@ -509,6 +521,11 @@ class AfdAgDecodeGraphRunner:
                     phase="decode",
                     retain_graph_objects=True,
                     retire_async_objects=False,
+                    # Never inside a capture -- see the A/B note at the
+                    # accumulate. This also means a normal graph-enabled run
+                    # records nothing at all, whatever the env var says, so the
+                    # instrumentation cannot destabilise anyone else's run.
+                    record_routing=False,
                 )
             for mb in range(num_mb):
                 with ctx.forward_batch(subs[mb]):
@@ -645,6 +662,7 @@ def _run_ag_pipeline_body(
     phase: str,
     retain_graph_objects: bool,
     retire_async_objects: bool,
+    record_routing: bool = True,
 ) -> None:
     """Shared AG multi-MB pipeline body used by eager fallback and graph capture."""
     num_layers = int(num_layers)
@@ -698,6 +716,29 @@ def _run_ag_pipeline_body(
                         )
                     else:
                         topk = model.route(layer, state.hidden[mb])
+                    # REAL routing, before it is consumed. Graph-safe no-op when
+                    # MINISGL_DUMP_EXPERT_LOAD is unset -- see utils/expert_load.
+                    #
+                    # Two gates, for two different reasons.
+                    #
+                    # record_routing is False during GRAPH CAPTURE. An A/B pair
+                    # settled this: same configuration, same nodes, same minute,
+                    # differing only in MINISGL_DUMP_EXPERT_LOAD -- off finished
+                    # in 8:04 with 30 decode steps, on wedged with 0. Capture was
+                    # the only place the accumulate still ran, so an accumulate
+                    # inside a captured graph is what breaks the run. (The
+                    # traceback moved between attempts, from this call to an
+                    # unrelated torch.empty in qkv_proj; that is the signature of
+                    # an async fault, and is why the traceback could not settle
+                    # it and the A/B could.) Consequence: recording needs decode
+                    # graphs DISABLED, so decode arrives on the eager path.
+                    #
+                    # phase == "decode" because this study prices a decode stage.
+                    # Prefill routes ~500x more tokens here (1152 prompts x 8192
+                    # against 16 generated), so including it would bury the
+                    # decode distribution under a prefill one.
+                    if record_routing and phase == "decode":
+                        expert_load.accumulate(layer, getattr(topk, "topk_ids", None))
                     if state.use_megamoe or bool(getattr(topk, "skip_moe", False)):
                         disp_x, disp_scale = None, None
                     else:

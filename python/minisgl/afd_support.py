@@ -54,6 +54,18 @@ _RUNTIME_ENV_KEYS = (
     "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
     "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
     "MINISGL_NVTX_CPU_TRACE",
+    # Real-routing capture. Ray merges runtime_env.env_vars on top of the
+    # inherited environment, so this would probably propagate anyway -- but
+    # "probably" here fails SILENTLY: expert_load.init() no-ops, the run
+    # succeeds, and the dump is simply absent. Name it explicitly.
+    "MINISGL_DUMP_EXPERT_LOAD",
+    # Serialises every launch so an async fault reports at the kernel that
+    # actually faulted. Needed because this fault's traceback moved between
+    # attempts (expert_load's index_add_, then qkv_proj's torch.empty, then
+    # qk_norm_rope) -- three different innocent bystanders, which is what an
+    # async CUDA error looks like and why reading the traceback kept
+    # mis-attributing it.
+    "CUDA_LAUNCH_BLOCKING",
     "NSYS",
     "MINISGL_AFD_MOE_BACKEND",
     "MINISGL_AFD_MAX_COMM_TOKENS",

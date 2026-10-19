@@ -347,13 +347,64 @@ def make_routes(
     global_tokens = torch.arange(tokens, dtype=torch.int64, device="cuda")
     global_tokens += (rank * 4 + lane) * tokens
     offsets = torch.arange(top_k, dtype=torch.int64, device="cuda")
-    ids = (global_tokens[:, None] * top_k + offsets[None, :]) % active_experts
+    if routing == "replay":
+        # Reproduce a RECORDED real-router distribution rather than a synthetic
+        # one. Deterministic per (rank, lane) so every process and every repeat
+        # of a configuration draws the same assignments -- a benchmark that
+        # resampled would add run-to-run variance on top of the effect being
+        # measured. top_k experts per token are drawn WITHOUT replacement, which
+        # is what a real top-k router does; drawing with replacement would let a
+        # token land on one expert twice and understate the spread.
+        if _REPLAY_WEIGHTS is None:
+            raise SystemExit("routing=replay requires --replay-distribution")
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(0x5EED0000 + rank * 4096 + lane)
+        probs = _REPLAY_WEIGHTS.to(device=offsets.device, dtype=torch.float32).expand(
+            tokens, -1
+        )
+        ids = torch.multinomial(probs, top_k, replacement=False, generator=gen)
+    else:
+        ids = (global_tokens[:, None] * top_k + offsets[None, :]) % active_experts
     raw_weights = torch.arange(top_k, 0, -1, dtype=torch.float32, device="cuda")
     weights = raw_weights.expand(tokens, -1).clone()
     if profile.gate_renormalize:
         weights /= weights.sum(dim=1, keepdim=True)
     counts = torch.bincount(ids.flatten(), minlength=num_experts)
     return ids.contiguous(), weights.contiguous(), counts
+
+
+_REPLAY_WEIGHTS: torch.Tensor | None = None
+
+
+def load_replay_distribution(path: str, num_experts: int) -> torch.Tensor:
+    """Per-expert selection weights from a recorded serving run.
+
+    Takes ``counts_total`` out of an expert_load JSON (written by
+    ``minisgl.utils.expert_load`` during a real run) and normalises it to a
+    probability over experts. The absolute token count in that run is
+    irrelevant here -- only the SHAPE of the skew transfers, because this
+    benchmark decides its own token count from the topology.
+    """
+    global _REPLAY_WEIGHTS
+    with open(path) as fh:
+        payload = json.load(fh)
+    counts = payload.get("counts_total")
+    if not counts:
+        raise SystemExit(f"{path}: no counts_total")
+    if len(counts) != num_experts:
+        raise SystemExit(
+            f"{path}: recorded {len(counts)} experts, profile has {num_experts}"
+        )
+    w = torch.tensor(counts, dtype=torch.float64)
+    if float(w.sum()) <= 0:
+        raise SystemExit(f"{path}: counts_total sums to zero")
+    # Kept on CPU deliberately. This loader runs during argument handling,
+    # BEFORE torch.cuda.set_device(local_rank), so ".to('cuda')" here would
+    # resolve to cuda:0 for every rank -- and the sampler would then hand a
+    # cuda:0 tensor to a rank living on cuda:3. The device is chosen at sample
+    # time instead, where the correct one is current.
+    _REPLAY_WEIGHTS = (w / w.sum()).cpu()
+    return _REPLAY_WEIGHTS
 
 
 def route_summary(counts: torch.Tensor) -> dict[str, float | int]:
@@ -701,7 +752,14 @@ def main() -> None:
     parser.add_argument("--mtp-nextn", type=int, default=0)
     parser.add_argument("--microbatches", type=int, choices=(1, 2, 3, 4), default=2)
     parser.add_argument("--layers", type=int, default=0, help="0 means all model MoE layers")
-    parser.add_argument("--routing", choices=("balanced", "hotset"), default="balanced")
+    parser.add_argument(
+        "--routing", choices=("balanced", "hotset", "replay"), default="balanced"
+    )
+    parser.add_argument(
+        "--replay-distribution",
+        default=None,
+        help="expert_load JSON from a real serving run; required for --routing replay",
+    )
     parser.add_argument("--hot-expert-fraction", type=float, default=0.25)
     parser.add_argument(
         "--backend",
@@ -723,6 +781,8 @@ def main() -> None:
     args = parser.parse_args()
 
     profile = get_megamoe_model_profile(args.model)
+    if args.routing == "replay":
+        load_replay_distribution(args.replay_distribution, profile.num_routed_experts)
     profile.validate(eg_size=args.eg_size)
     layers = profile.num_moe_layers if args.layers == 0 else args.layers
     if not 1 <= layers <= profile.num_moe_layers:
@@ -733,6 +793,10 @@ def main() -> None:
         raise SystemExit("sequences-per-ag-rank must divide evenly across microbatches")
     if args.mtp_nextn < 0:
         raise SystemExit("mtp-nextn must be non-negative")
+    if args.routing == "replay" and not args.replay_distribution:
+        raise SystemExit("--routing replay requires --replay-distribution")
+    if args.replay_distribution and args.routing != "replay":
+        raise SystemExit("--replay-distribution is only meaningful with --routing replay")
     if not 0 < args.hot_expert_fraction <= 1:
         raise SystemExit("hot-expert-fraction must be in (0, 1]")
     if args.warmups < 1 or args.iterations < 3:
@@ -1050,6 +1114,7 @@ def main() -> None:
                 "layers": layers,
                 "routing": args.routing,
                 "hot_expert_fraction": args.hot_expert_fraction,
+                "replay_distribution": args.replay_distribution,
                 "routing_load": route_summary(local_route_counts.cpu()),
                 "routing_identity": (
                     "model routed experts; MegaMoE injects shared route in the AG kernel"

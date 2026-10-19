@@ -300,6 +300,40 @@ _PROFILES["deepseek_v4_pro_fp4"] = replace(
     ),
 )
 
+# Kimi-K3 LatentMoE: the 896 routed experts run entirely in the 3584 latent
+# space, so the dispatched stage is (3584 -> 3072 -> 3584, top-16). The
+# hidden<->latent projections and the two shared experts (full 7168 hidden,
+# 2 x 3072) are dense GEMMs outside this stage, as in AIC's KimiK3 model.
+# SiTU is not a MegaMoE epilogue; SiLU stands in with the same GEMM shapes.
+_PROFILES["kimi_k3_fp4"] = MegaMoEModelProfile(
+    key="kimi_k3_fp4",
+    model_path="moonshotai/Kimi-K3",
+    simulation_model_path="moonshotai/Kimi-K3",
+    architecture="KimiK3ForConditionalGeneration",
+    num_hidden_layers=93,
+    num_moe_layers=92,
+    hidden_size=3584,
+    intermediate_size=3072,
+    num_routed_experts=896,
+    routed_top_k=16,
+    num_shared_experts=0,
+    shared_intermediate_size=0,
+    gate_renormalize=True,
+    routed_scaling_factor=1.0,
+    scoring_func="sigmoid",
+    has_router_correction_bias=True,
+    activation="silu",
+    activation_alpha=1.0,
+    activation_clamp=None,
+    activation_up_bias=0.0,
+    weight_precision="fp4",
+    moe_quant_contract="w4a8_mxfp4_mxfp8",
+    checkpoint_precision=(
+        "synthetic deterministic BF16 benchmark weights quantized to E2M1 with "
+        "UE8M0 block-32 scales; no checkpoint weights are loaded"
+    ),
+)
+
 MEGAMOE_MODEL_PROFILES = dict(_PROFILES)
 
 
