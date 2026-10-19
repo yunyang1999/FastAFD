@@ -68,7 +68,7 @@ class EngineDriver:
         self.engine = Engine(cfg)
         self.cfg = cfg
         self.page_size = self.engine.ctx.page_size
-        self.free_pages = list(range(self.engine.num_pages))
+        self.free_pages = list(range(self.engine.num_pages - 1, -1, -1))  # pop() = lowest page
         self.free_tables = list(range(max_running_req))
         self.reqs: dict[int, _ReqState] = {}
         self.device = self.engine.device
@@ -82,11 +82,13 @@ class EngineDriver:
         P = self.page_size
         need = (upto + P - 1) // P
         while len(st.pages) < need:
-            pg = self.free_pages.pop(0)
+            pg = self.free_pages.pop()
             st.pages.append(pg)
             i = len(st.pages) - 1
-            vals = torch.arange(pg * P, (pg + 1) * P, dtype=torch.int32, device=self.device)
-            self.engine.page_table[st.table_idx, i * P : (i + 1) * P] = vals
+            width = self.engine.page_table.shape[1]
+            hi = min((i + 1) * P, width)
+            vals = torch.arange(pg * P, pg * P + (hi - i * P), dtype=torch.int32, device=self.device)
+            self.engine.page_table[st.table_idx, i * P : hi] = vals
 
     # ---------------- batches ----------------
     def _make_batch(self, items: list[tuple[int, int]], phase: str):

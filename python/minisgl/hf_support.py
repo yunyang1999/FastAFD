@@ -62,6 +62,9 @@ def _load_chat_template_from_path(path: str) -> str:
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
+    # Dummy-weight benchmarks of models whose tokenizer needs extra packages
+    # (e.g. Kimi-K3 / tiktoken) may point at another tokenizer directory.
+    model_path = os.environ.get("MINISGL_TOKENIZER_PATH") or model_path
     local_only = local_files_only()
     resolved_model_path = resolve_local_model_dir(model_path, local_only=local_only)
     tokenizer = AutoTokenizer.from_pretrained(

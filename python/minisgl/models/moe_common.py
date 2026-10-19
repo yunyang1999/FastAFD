@@ -203,6 +203,15 @@ def torch_ref_moe(
         return out.to(x.dtype)
     local = topk_ids.long() - expert_offset
     valid = (local >= 0) & (local < E)
+    if torch.cuda.is_current_stream_capturing():
+        # static-shape variant for CUDA graphs: every local expert on every token
+        dense = torch.zeros(T, E, dtype=torch.float32, device=x.device)
+        dense.scatter_add_(1, local.clamp(0, E - 1), torch.where(valid, topk_weights.float(), 0.0))
+        for e in range(E):
+            h = x.float() @ w13[e].float().t()
+            a = act(h[:, :inter], h[:, inter:])
+            out += (a.to(x.dtype).float() @ w2[e].float().t()) * dense[:, e : e + 1]
+        return out.to(x.dtype)
     for e in torch.unique(local[valid]).tolist():
         tok, slot = torch.where(local == e)
         h = x[tok].float() @ w13[e].float().t()

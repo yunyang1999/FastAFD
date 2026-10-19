@@ -12,6 +12,13 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+TAPS: list | None = None
+
+
+def _tap(name, t):
+    if TAPS is not None:
+        TAPS.append((name, t.detach().clone()))
+
 
 def rmsnorm(x, w, eps):
     dtype = x.dtype
@@ -198,6 +205,7 @@ class RefKimiK3:
             prefix = h if prefix is None else prefix + h
             hs = apply_attn_res(prefix, block, P[f"{pf}.mlp_res_proj.weight"], P[f"{pf}.mlp_res_norm.weight"], self.eps)
             hs = rmsnorm(hs, P[f"{pf}.post_attention_layernorm.weight"], self.eps)
+            _tap(f"L{i}.moe_in", hs)
             if i >= cfg.get("first_k_dense_replace", 0):
                 hs = self.moe(hs, i)
             else:
