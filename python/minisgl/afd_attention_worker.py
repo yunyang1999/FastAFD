@@ -163,6 +163,12 @@ class AfdAttentionState:
                 mem_GB(reserve),
             )
         memory_cap = available_memory // cache_per_page
+        if hybrid is not None:
+            # DSV4/K3 cache rows are tiny per token (and K3 pages are single
+            # tokens): never allocate more than every request slot at full
+            # length could use, which keeps the page bookkeeping small.
+            need = (config.max_running_req + 1) * int(config.max_seq_len)
+            memory_cap = min(memory_cap, (need + config.page_size - 1) // config.page_size + 1)
         requested = config.num_page_override
         if requested is None:
             num_pages = memory_cap
