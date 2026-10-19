@@ -277,7 +277,9 @@ def numerics_dsv4(args):
                 cmp(f"dsv4 L={L} full-forward logits (forced routing, ref FP8 act-quant) call{s}", mine[s], rf, logits=True)
             ref_dsv4.ACT_QUANT = False
         ref_dsv4.FORCE_IDS = None
-        # module-level replay with my inputs
+        # module-level replay with my inputs (FP8 checkpoints: reference with the
+        # same FP8 activation quantisation as the engine's FP8 GEMMs)
+        ref_dsv4.ACT_QUANT = bool(args.fp8)
         for l in range(rargs["n_layers"]):
             ra = RefAttention(P, l, rargs, 1024, dev)
             rm = RefMoE(P, l, rargs, experts[l], shared[l])
@@ -291,6 +293,7 @@ def numerics_dsv4(args):
                 ids = torch.tensor(all_ids[start : start + xm.shape[0]], device=dev)
                 ym = rm.forward(xm.unsqueeze(0), ids.unsqueeze(0))[0]
                 cmp(f"dsv4 L={L} layer{l} moe call{c}", tap_get(tp, f"L{l}.moe_out"), ym)
+        ref_dsv4.ACT_QUANT = False
         # chunked prefill and graph decode consistency on the same prompt
         mine_c, _ = run_mine(drv, uid, prompt, args.steps, nxt, chunk=64)
         uid += 1
