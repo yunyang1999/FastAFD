@@ -151,12 +151,16 @@ class AfdAttentionState:
             # so reserve them (estimated from the meta model) explicitly.
             cache_per_page, fixed_bytes = hybrid
             weight_bytes = _afd_attention_weight_bytes(config)
-            available_memory -= fixed_bytes + weight_bytes
+            # The attention-stage weights and the MegaMoE symmetric buffers are
+            # allocated after the cache is sized: reserve both explicitly.
+            reserve = int(float(os.environ.get("MINISGL_AFD_HYBRID_RESERVE_GB", "16")) * (1 << 30))
+            available_memory -= fixed_bytes + weight_bytes + reserve
             logger.info(
-                "AfdAttentionState hybrid cache: %.0f B/token, fixed %s, attention weights %s",
+                "AfdAttentionState hybrid cache: %.0f B/token, fixed %s, attention weights %s, reserve %s",
                 cache_per_page / config.page_size,
                 mem_GB(fixed_bytes),
                 mem_GB(weight_bytes),
+                mem_GB(reserve),
             )
         memory_cap = available_memory // cache_per_page
         requested = config.num_page_override
@@ -216,7 +220,7 @@ def _afd_attention_weight_bytes(config) -> int:
     with torch.device("meta"), torch_dtype(config.dtype):
         model = attention_stage_class(config.model_config)(config.model_config)
     total = sum(t.numel() * t.element_size() for t in model.state_dict().values())
-    return int(total * 1.05) + (2 << 30)  # + workspaces / activations margin
+    return int(total * 1.02) + (1 << 30)  # + dummy-init / load temporaries
 
 
 # ---------------------------------------------------------------------------
