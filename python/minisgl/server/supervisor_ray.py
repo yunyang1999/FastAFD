@@ -46,6 +46,12 @@ _RAY_ENV_KEYS = (
     # has to clear both to reach a worker, and missing either one fails
     # silently -- the run succeeds and simply records nothing.
     "MINISGL_DUMP_EXPERT_LOAD",
+    # DeepSeek-V4 / Kimi-K3 knobs (also in afd_support._RUNTIME_ENV_KEYS)
+    "MINISGL_AFD_MEGAMOE_PROFILE",
+    "MINISGL_KDA_STATE_DTYPE",
+    "MINISGL_MOE_EXEC",
+    "MINISGL_ROPE_TABLE_LEN",
+    "MINISGL_TOKENIZER_PATH",
     "NSYS",
     "NCCL_DEBUG",
     "NCCL_DEBUG_SUBSYS",
