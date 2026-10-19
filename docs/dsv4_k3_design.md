@@ -135,3 +135,47 @@ Deviations / limits (current state):
 * Prefix caching is not supported (`--cache-type naive`).
 * K3 tokenizer needs `tiktoken`, which the `minisgl-cuda130` env lacks; dummy
   runs set `MINISGL_TOKENIZER_PATH` to another tokenizer directory.
+
+## 7. How to run
+
+Model directories: a real HF checkpoint directory, or (dummy weights) a
+config/tokenizer-only copy made by
+`scripts/experiments/afd/dsv4_k3/make_model_dir.py --src HF_DIR --dst DIR [--layers N]`
+(`--layers` keeps every layer kind: DSV4 SWA/C4/C128 + hash routing, K3
+KDA/MLA/dense/LatentMoE).
+
+Colocated (one node, TP = EP = 4):
+
+```bash
+# DeepSeek-V4 (Flash or Pro)
+python -m minisgl --model-path $DIR --dummy-weight --tensor-parallel-size 4 \
+  --attention-backend dsv4 --page-size 128 --max-running-requests 64 \
+  --cuda-graph-max-bs 64 --max-seq-len-override 4096 --memory-ratio 0.85
+# Kimi-K3 (MINISGL_TOKENIZER_PATH=<other tokenizer dir> if tiktoken is missing)
+python -m minisgl --model-path $DIR --dummy-weight --tensor-parallel-size 4 \
+  --attention-backend kimi --page-size 1 --max-running-requests 64 \
+  --cuda-graph-max-bs 64 --max-seq-len-override 4096 --memory-ratio 0.85
+```
+
+Drop `--dummy-weight` to load a real checkpoint (`models/ckpt_loaders.py`).
+`MINISGL_MOE_EXEC=torch` switches the routed experts from colocated MegaMoE to
+the torch reference executor.
+
+AFD (attention workers + MegaMoE expert workers, `MINISGL_AFD_MOE_BACKEND=megamoe_m2n`
+is set by the runner): `submit_afd_hybrid.sbatch` starts a Ray cluster (GPU-less
+head + GPU workers; `HEAD_GPUS=1` to use the head's GPUs too) and runs
+`afd_cases.sh`, which starts one server per case and sweeps the per-attention-GPU
+batch size; `step_times.json` per case holds the median decode step time.
+
+```bash
+CONDA_ROOT=... FASTAFD_ROOT=$PWD ENV_SETUP=<optional env file> \
+RUN_SCRIPT=$PWD/scripts/experiments/afd/dsv4_k3/afd_cases.sh \
+DSV4K3_META_DIR=<dir with DeepSeek-V4-Flash, DeepSeek-V4-Pro, Kimi-K3> AFD_OUT_DIR=<out> \
+CASES="k3:16:16:8/16/32/64 dsv4_pro:24:8:8/16/32/64/128 dsv4_flash:28:4:8/16/32/64/128" \
+K3_TOKENIZER_PATH=<tokenizer dir> \
+sbatch -N 9 --segment=9 --account=<acct> --partition=<gb200 partition> --time=03:00:00 \
+  scripts/experiments/afd/dsv4_k3/submit_afd_hybrid.sbatch
+```
+
+`LAYERS=4` gives the reduced-depth variant; `MODEL_DIR_<model>=<checkpoint>` with
+`DUMMY_WEIGHT=0` serves real weights.
