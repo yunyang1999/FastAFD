@@ -21,7 +21,8 @@ def make_reduced_model_dir(src_dir: str, dst_dir: str, overrides: dict, text_con
     src, dst = Path(src_dir), Path(dst_dir)
     dst.mkdir(parents=True, exist_ok=True)
     for f in src.iterdir():
-        if f.is_file() and f.suffix in (".json", ".py", ".model", ".txt") and "index" not in f.name and f.name != "config.json":
+        # no .py: remote code of the checkpoint is never copied / imported
+        if f.is_file() and f.suffix in (".json", ".model", ".txt") and "index" not in f.name and f.name != "config.json":
             shutil.copy(f, dst / f.name)
     cfg = json.loads((src / "config.json").read_text())
     target = cfg["text_config"] if text_config else cfg

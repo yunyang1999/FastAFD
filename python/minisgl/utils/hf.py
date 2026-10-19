@@ -30,20 +30,21 @@ def _load_raw_config_dict(resolved_model_path: str, local_files_only: bool) -> d
 
 @functools.cache
 def _load_hf_config_cached(resolved_model_path: str, local_files_only: bool) -> Any:
+    # Architectures newer than the pinned transformers (deepseek_v4) or shipped
+    # as remote code (kimi_k3) are parsed by minisgl itself from the raw
+    # config.json (see ModelConfig.from_hf); checked first so their remote
+    # configuration code is never imported.
     try:
-        return AutoConfig.from_pretrained(
-            resolved_model_path,
-            local_files_only=local_files_only,
-            trust_remote_code=True,
-        )
-    except Exception:
-        # Architectures newer than the pinned transformers (deepseek_v4) or
-        # shipped as remote code (kimi_k3) are parsed by minisgl itself from
-        # the raw config.json; see ModelConfig.from_hf.
         raw = _load_raw_config_dict(resolved_model_path, local_files_only)
-        if raw.get("model_type") not in _RAW_CONFIG_MODEL_TYPES:
-            raise
+    except Exception:
+        raw = None
+    if raw is not None and raw.get("model_type") in _RAW_CONFIG_MODEL_TYPES:
         return PretrainedConfig(**raw)
+    return AutoConfig.from_pretrained(
+        resolved_model_path,
+        local_files_only=local_files_only,
+        trust_remote_code=True,
+    )
 
 
 def _load_hf_config(model_path: str) -> Any:
