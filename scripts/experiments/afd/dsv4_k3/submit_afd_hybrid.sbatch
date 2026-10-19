@@ -18,6 +18,7 @@
 
 set -euo pipefail
 : "${CONDA_ROOT:?}" "${FASTAFD_ROOT:?}" "${RUN_SCRIPT:?}"
+[[ -s "${RUN_SCRIPT}" ]] || { echo "RUN_SCRIPT ${RUN_SCRIPT} is missing or empty" >&2; exit 2; }
 export CONDA_ROOT FASTAFD_ROOT RUN_SCRIPT
 export CONDA_ENV="${CONDA_ENV:-minisgl-cuda130}"
 export ENV_SETUP="${ENV_SETUP:-}"
