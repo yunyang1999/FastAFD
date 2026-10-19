@@ -89,6 +89,8 @@ class AfdAttentionState:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            num_req_slots=config.max_running_req + 1,
+            scratch_rows=_afd_max_forward_tokens(config),
         )
         # One attention backend per microbatch because each wrapper owns mutable
         # decode metadata. The compute stream still serializes actual launches.
@@ -127,6 +129,8 @@ class AfdAttentionState:
         return min_free_memory, max_free_memory
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
+        from minisgl.kvcache import hybrid_cache_sizing
+
         cache_per_page = (
             2
             * config.model_config.head_dim
@@ -136,6 +140,24 @@ class AfdAttentionState:
             * config.model_config.num_layers
         )
         available_memory = int(config.memory_ratio * old_free_memory)
+        hybrid = hybrid_cache_sizing(
+            config.model_config,
+            page_size=config.page_size,
+            num_req_slots=config.max_running_req + 1,
+            scratch_rows=_afd_max_forward_tokens(config),
+        )
+        if hybrid is not None:
+            # The attention-stage weights are loaded after the cache is sized,
+            # so reserve them (estimated from the meta model) explicitly.
+            cache_per_page, fixed_bytes = hybrid
+            weight_bytes = _afd_attention_weight_bytes(config)
+            available_memory -= fixed_bytes + weight_bytes
+            logger.info(
+                "AfdAttentionState hybrid cache: %.0f B/token, fixed %s, attention weights %s",
+                cache_per_page / config.page_size,
+                mem_GB(fixed_bytes),
+                mem_GB(weight_bytes),
+            )
         memory_cap = available_memory // cache_per_page
         requested = config.num_page_override
         if requested is None:
@@ -178,6 +200,23 @@ class AfdAttentionState:
     def shutdown(self) -> None:
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _afd_max_forward_tokens(config) -> int:
+    from minisgl.engine.engine import max_forward_tokens
+
+    return max_forward_tokens(config)
+
+
+def _afd_attention_weight_bytes(config) -> int:
+    """Bytes of the attention-stage model (meta construction, no allocation)."""
+    from minisgl.models.afd_hybrid import attention_stage_class
+    from minisgl.utils import torch_dtype
+
+    with torch.device("meta"), torch_dtype(config.dtype):
+        model = attention_stage_class(config.model_config)(config.model_config)
+    total = sum(t.numel() * t.element_size() for t in model.state_dict().values())
+    return int(total * 1.05) + (2 << 30)  # + workspaces / activations margin
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +281,21 @@ def afd_moe_output(hidden: torch.Tensor, topk: Any) -> torch.Tensor:
     scale = float(getattr(topk, "routed_scaling_factor", 1.0))
     if scale != 1.0:
         hidden = hidden * scale
+    # Models whose dispatched tensor is not the hidden state (Kimi-K3 LatentMoE)
+    # map the combined expert output back to the hidden space here.
+    post_fn = getattr(topk, "post_fn", None)
+    if post_fn is not None:
+        return post_fn(hidden)
     shared_output = getattr(topk, "shared_output", None)
     if shared_output is not None:
         hidden = hidden + shared_output
     return hidden
+
+
+def afd_dispatch_input(hidden: torch.Tensor, topk: Any) -> torch.Tensor:
+    """Tensor sent to the expert workers (the latent for LatentMoE models)."""
+    x = getattr(topk, "dispatch_input", None)
+    return hidden if x is None else x
 
 
 def afd_dispatch_payload(hidden: torch.Tensor, topk: Any):
@@ -393,7 +443,7 @@ class AfdAgDecodeGraphRunner:
                         continue
                     if is_megamoe_backend:
                         hidden = adapter.ag_moe(
-                            hidden, topk.topk_ids, topk.topk_weights,
+                            afd_dispatch_input(hidden, topk), topk.topk_ids, topk.topk_weights,
                             external_quant=bool(
                                 getattr(topk, "external_quant", False)
                             ),
@@ -646,9 +696,11 @@ def _record_stream(tensor, stream: torch.cuda.Stream) -> None:
 def _record_topk_streams(topk, stream: torch.cuda.Stream, *, include_router: bool) -> None:
     _record_stream(getattr(topk, "topk_ids", None), stream)
     _record_stream(getattr(topk, "topk_weights", None), stream)
+    _record_stream(getattr(topk, "dispatch_input", None), stream)
+    if include_router or getattr(topk, "post_fn", None) is not None:
+        _record_stream(getattr(topk, "shared_output", None), stream)
     if include_router:
         _record_stream(getattr(topk, "router_logits", None), stream)
-        _record_stream(getattr(topk, "shared_output", None), stream)
 
 
 def _run_ag_pipeline_body(
@@ -763,6 +815,7 @@ def _run_ag_pipeline_body(
             getattr(topk, "router_logits", None),
             getattr(topk, "shared_output", None),
             getattr(topk, "local_output", None),
+            getattr(topk, "dispatch_input", None),
         )
         return disp_x, disp_scale, topk
 
@@ -784,7 +837,7 @@ def _run_ag_pipeline_body(
             with torch.cuda.stream(comm_stream):
                 comm_stream.wait_event(state.ready_events[layer][mb])
                 state.hidden[mb] = adapter_mb.ag_moe(
-                    state.hidden[mb],
+                    afd_dispatch_input(state.hidden[mb], topk),
                     topk.topk_ids,
                     topk.topk_weights,
                     lane=mb,

@@ -468,234 +468,241 @@ class BaseAfdWorker:
         # A DeepEP ElasticBuffer owns the metadata/workspace that combine reads
         # through the dispatch handle, so each in-flight MB gets one adapter lane.
         adapter_lanes = max(1, int(self.afd_num_mb))
-        arch0 = getattr(mc, "architectures", [""])[0]
-        model_extra = getattr(mc, "model_extra", {})
-        self._afd_moe_backend = afd_env("MOE_BACKEND", "deepep")
-        if self._afd_moe_backend == "megamoe_m2n":
-            os.environ.setdefault("MINISGL_MEGAMOE_AG_SMS", "24")
-            n_shared_experts = int(model_extra.get("n_shared_experts", 0) or 0)
-            remote_shared_experts = (
-                arch0 == "Glm4MoeForCausalLM"
-                and n_shared_experts > 0
-            )
-            if remote_shared_experts and n_shared_experts != 1:
-                raise RuntimeError(
-                    "megamoe_m2n remote shared expert currently supports exactly "
-                    f"one GLM shared expert, got n_shared_experts={n_shared_experts}"
-                )
-            # Split MegaMoE M2N: one fused kernel per side per layer over the
-            # union world; the adapter holds one symmetric buffer per lane.
-            from minisgl.moe.megamoe_m2n_afd import MegaMoEM2NAfdAdapter
+        from minisgl.models.afd_hybrid import hybrid_afd_spec
 
-            mega_adapter = MegaMoEM2NAfdAdapter(
-                group=dist.group.WORLD,
-                ag_size=ag_size,
-                eg_size=eg_size,
-                real_num_experts=int(mc.num_experts),
-                hidden_size=int(mc.hidden_size),
-                intermediate_size=int(mc.moe_intermediate_size),
-                top_k=int(mc.num_experts_per_tok),
-                num_max_dispatch_tokens_per_rank=bucket,
-                num_lanes=adapter_lanes,
-                gate_renormalize=bool(getattr(mc, "norm_topk_prob", True)),
-                shared_experts_per_rank=1 if remote_shared_experts else 0,
-                routed_scaling_factor=float(model_extra.get("routed_scaling_factor", 1.0)),
-            )
-            # Lane view keeps the downstream `adapters[mb % len(adapters)]`
-            # indexing working; every lane shares the adapter object and picks
-            # its own symmetric buffer via the `lane` argument.
-            self._afd_adapters = [mega_adapter] * adapter_lanes
-            self._afd_adapter = mega_adapter
-            log_line(
-                self.log_path,
-                f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_adapter "
-                f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
-                f"remote_shared={int(remote_shared_experts)} "
-                f"eg_expected_tokens_override={mega_adapter.eg_expected_tokens_override} "
-                f"eg_expected_tokens_source={mega_adapter.eg_expected_tokens_source}",
-                flush=True,
-            )
+        hybrid = hybrid_afd_spec(mc)
+        self._moe_layer_ids = tuple(range(int(mc.num_layers)))
+        if hybrid is not None:
+            self._init_hybrid_runtime(hybrid, ag_size, eg_size, bucket, adapter_lanes)
         else:
-            if adapter_lanes > 1:
-                os.environ["MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM"] = "1"
-            self._afd_adapters = [
-                DeepEPM2NAdapter(
+            arch0 = getattr(mc, "architectures", [""])[0]
+            model_extra = getattr(mc, "model_extra", {})
+            self._afd_moe_backend = afd_env("MOE_BACKEND", "deepep")
+            if self._afd_moe_backend == "megamoe_m2n":
+                os.environ.setdefault("MINISGL_MEGAMOE_AG_SMS", "24")
+                n_shared_experts = int(model_extra.get("n_shared_experts", 0) or 0)
+                remote_shared_experts = (
+                    arch0 == "Glm4MoeForCausalLM"
+                    and n_shared_experts > 0
+                )
+                if remote_shared_experts and n_shared_experts != 1:
+                    raise RuntimeError(
+                        "megamoe_m2n remote shared expert currently supports exactly "
+                        f"one GLM shared expert, got n_shared_experts={n_shared_experts}"
+                    )
+                # Split MegaMoE M2N: one fused kernel per side per layer over the
+                # union world; the adapter holds one symmetric buffer per lane.
+                from minisgl.moe.megamoe_m2n_afd import MegaMoEM2NAfdAdapter
+
+                mega_adapter = MegaMoEM2NAfdAdapter(
                     group=dist.group.WORLD,
                     ag_size=ag_size,
                     eg_size=eg_size,
                     real_num_experts=int(mc.num_experts),
                     hidden_size=int(mc.hidden_size),
+                    intermediate_size=int(mc.moe_intermediate_size),
                     top_k=int(mc.num_experts_per_tok),
                     num_max_dispatch_tokens_per_rank=bucket,
+                    num_lanes=adapter_lanes,
+                    gate_renormalize=bool(getattr(mc, "norm_topk_prob", True)),
+                    shared_experts_per_rank=1 if remote_shared_experts else 0,
+                    routed_scaling_factor=float(model_extra.get("routed_scaling_factor", 1.0)),
                 )
-                for _lane in range(adapter_lanes)
-            ]
-            self._afd_adapter = self._afd_adapters[0]
-            log_line(
-                self.log_path,
-                f"[{self.role} rank={self.tp_rank}] afd_deepep_adapters "
-                f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
-                f"per_buffer_comm_stream={os.environ.get('MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM', '0')}",
-                flush=True,
-            )
-
-        # Keep fp8 weights and *_scale (float32) as-is. Router gates/biases
-        # that need FP32 are listed below; everything else follows model dtype.
-        is_minimax_m2 = arch0 == "MiniMaxM2ForCausalLM"
-        is_glm4_moe = arch0 == "Glm4MoeForCausalLM"
-
-        def _minimax_fp32_key(key: str) -> bool:
-            return is_minimax_m2 and (
-                key.endswith(".mlp.gate.weight")
-                or key.endswith(".mlp.e_score_correction_bias")
-            )
-
-        def _glm4_fp32_key(key: str) -> bool:
-            return is_glm4_moe and (
-                key.endswith(".mlp.gate.weight")
-                or key.endswith(".mlp.gate.e_score_correction_bias")
-            )
-
-        def _cast_full(pairs):
-            tgt = config.dtype
-            return {
-                k: (
-                    v
-                    if v.dtype == torch.float8_e4m3fn
-                    or (v.dtype == torch.float32 and k.endswith("_scale"))
-                    else v.to(torch.float32)
-                    if _minimax_fp32_key(k) or _glm4_fp32_key(k)
-                    else v.to(tgt)
-                )
-                for k, v in pairs
-            }
-
-        def _afd_stage_classes():
-            arch = (getattr(mc, "architectures", None) or [""])[0]
-            if arch == "Qwen3MoeForCausalLM":
-                from minisgl.models.qwen3_moe_afd import (
-                    Qwen3AfdDenseRouterForCausalLM,
-                    Qwen3AfdExpertStage,
-                )
-
-                return Qwen3AfdDenseRouterForCausalLM, Qwen3AfdExpertStage
-            if arch == "MiniMaxM2ForCausalLM":
-                from minisgl.models.minimax_m2_afd import (
-                    MiniMaxM2AfdDenseRouterForCausalLM,
-                    MiniMaxM2AfdExpertStage,
-                )
-
-                return MiniMaxM2AfdDenseRouterForCausalLM, MiniMaxM2AfdExpertStage
-            if arch == "Glm4MoeForCausalLM":
-                from minisgl.models.glm4_moe_afd import (
-                    Glm4AfdDenseRouterForCausalLM,
-                    Glm4AfdExpertStage,
-                )
-
-                return Glm4AfdDenseRouterForCausalLM, Glm4AfdExpertStage
-            raise RuntimeError(f"AFD AG/EG does not support architecture {arch!r}")
-
-        AfdDenseRouterForCausalLM, AfdExpertStage = _afd_stage_classes()
-
-        if self.role == "attention":
-            from minisgl.layers import set_rope_device
-
-            set_rope_device(runtime_state.device)
-            with torch.device("meta"), torch_dtype(config.dtype):
-                model = AfdDenseRouterForCausalLM(mc)
-            full = _cast_full(load_weight(config.model_path, runtime_state.device, skip_expert_weights=True))
-            model.load_state_dict(extract_stage_state_dict(model, full))
-            del full
-            self._afd_ag_model = model
-            self._afd_sampler = Sampler(runtime_state.device, int(mc.vocab_size))
-        else:
-            # The AFD EG stage receives already-dispatched DeepEPM2N payloads
-            # from the outer adapter above. Its per-layer MoELayer objects are
-            # only expert weight holders plus DeepGEMM runners; AFD EG model
-            # classes explicitly disable MoELayer's internal A2A dispatcher.
-            with torch.device("meta"), torch_dtype(config.dtype):
-                model = AfdExpertStage(mc)
-            full = _cast_full(
-                load_weight(config.model_path, runtime_state.device, skip_non_expert_weights=True)
-            )
-            model.load_state_dict(extract_stage_state_dict(model, full))
-            del full
-            try:
-                sd = model.state_dict()
-                tensor_bytes = sum(int(t.numel() * t.element_size()) for t in sd.values())
-                remote_layers = [
-                    layer
-                    for layer in getattr(model.model.layers, "op_list", [])
-                    if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
-                ]
-                shapes = []
-                for idx in (0, len(remote_layers) - 1):
-                    if 0 <= idx < len(remote_layers):
-                        experts = remote_layers[idx].mlp.experts
-                        shapes.append(
-                            "layer_index="
-                            f"{idx} local_experts={int(getattr(experts, 'local_num_experts', -1))} "
-                            f"gate_up={tuple(experts.gate_up_proj.shape)}:{experts.gate_up_proj.dtype} "
-                            f"down={tuple(experts.down_proj.shape)}:{experts.down_proj.dtype}"
-                        )
+                # Lane view keeps the downstream `adapters[mb % len(adapters)]`
+                # indexing working; every lane shares the adapter object and picks
+                # its own symmetric buffer via the `lane` argument.
+                self._afd_adapters = [mega_adapter] * adapter_lanes
+                self._afd_adapter = mega_adapter
                 log_line(
                     self.log_path,
-                    f"[{self.role} rank={self.tp_rank}] afd_eg_model_memory "
-                    f"state_tensors={len(sd)} state_bytes={tensor_bytes} "
-                    f"state_gib={tensor_bytes / (1024**3):.2f} "
-                    f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f} "
-                    f"cuda_reserved_gib={torch.cuda.memory_reserved() / (1024**3):.2f} "
-                    + " ".join(shapes),
+                    f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_adapter "
+                    f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
+                    f"remote_shared={int(remote_shared_experts)} "
+                    f"eg_expected_tokens_override={mega_adapter.eg_expected_tokens_override} "
+                    f"eg_expected_tokens_source={mega_adapter.eg_expected_tokens_source}",
                     flush=True,
                 )
-            except Exception as exc:
-                log_line(
-                    self.log_path,
-                    f"[{self.role} rank={self.tp_rank}] afd_eg_model_memory_log_failed "
-                    f"{type(exc).__name__}: {exc}",
-                    flush=True,
-                )
-            if self._afd_moe_backend == "megamoe_m2n":
-                # One-time per-layer requant of FP8 expert weights to the mega
-                # kernel's per-32 UE8M0 interleaved format.
-                layers = model.model.layers.op_list
-                registered_layers = 0
-                for layer_id, eg_layer in enumerate(layers):
-                    experts = eg_layer.mlp.experts
-                    shared_experts = getattr(eg_layer.mlp, "shared_experts", None)
-                    self._afd_adapter.register_eg_layer_weights(
-                        layer_id, experts, shared_experts=shared_experts
-                    )
-                    registered_layers += 1
-                    # MegaMoE keeps its transformed weights in the adapter. Drop
-                    # the Qwen-format tensors immediately; retaining both forms
-                    # OOMs on the 235B expert ranks.
-                    experts.gate_up_proj = None
-                    experts.gate_up_proj_scale = None
-                    experts.down_proj = None
-                    experts.down_proj_scale = None
-                    if shared_experts is not None:
-                        shared_experts.gate_up_proj.weight = None
-                        shared_experts.gate_up_proj.weight_scale = None
-                        shared_experts.down_proj.weight = None
-                        shared_experts.down_proj.weight_scale = None
-                    if layer_id % 4 == 3:
-                        torch.cuda.empty_cache()
-                log_line(
-                    self.log_path,
-                    f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_weights "
-                    f"registered layers={registered_layers}/{len(layers)}",
-                    flush=True,
-                )
-                # MegaMoE runtime owns the transformed weights in the adapter.
-                # Drop the ExpertStage object too; the EG persistent and
-                # per-layer MegaMoE paths never call run_experts().
-                self._afd_eg_model = None
-                del layers
-                del model
-                torch.cuda.empty_cache()
             else:
-                self._afd_eg_model = model
+                if adapter_lanes > 1:
+                    os.environ["MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM"] = "1"
+                self._afd_adapters = [
+                    DeepEPM2NAdapter(
+                        group=dist.group.WORLD,
+                        ag_size=ag_size,
+                        eg_size=eg_size,
+                        real_num_experts=int(mc.num_experts),
+                        hidden_size=int(mc.hidden_size),
+                        top_k=int(mc.num_experts_per_tok),
+                        num_max_dispatch_tokens_per_rank=bucket,
+                    )
+                    for _lane in range(adapter_lanes)
+                ]
+                self._afd_adapter = self._afd_adapters[0]
+                log_line(
+                    self.log_path,
+                    f"[{self.role} rank={self.tp_rank}] afd_deepep_adapters "
+                    f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
+                    f"per_buffer_comm_stream={os.environ.get('MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM', '0')}",
+                    flush=True,
+                )
+
+            # Keep fp8 weights and *_scale (float32) as-is. Router gates/biases
+            # that need FP32 are listed below; everything else follows model dtype.
+            is_minimax_m2 = arch0 == "MiniMaxM2ForCausalLM"
+            is_glm4_moe = arch0 == "Glm4MoeForCausalLM"
+
+            def _minimax_fp32_key(key: str) -> bool:
+                return is_minimax_m2 and (
+                    key.endswith(".mlp.gate.weight")
+                    or key.endswith(".mlp.e_score_correction_bias")
+                )
+
+            def _glm4_fp32_key(key: str) -> bool:
+                return is_glm4_moe and (
+                    key.endswith(".mlp.gate.weight")
+                    or key.endswith(".mlp.gate.e_score_correction_bias")
+                )
+
+            def _cast_full(pairs):
+                tgt = config.dtype
+                return {
+                    k: (
+                        v
+                        if v.dtype == torch.float8_e4m3fn
+                        or (v.dtype == torch.float32 and k.endswith("_scale"))
+                        else v.to(torch.float32)
+                        if _minimax_fp32_key(k) or _glm4_fp32_key(k)
+                        else v.to(tgt)
+                    )
+                    for k, v in pairs
+                }
+
+            def _afd_stage_classes():
+                arch = (getattr(mc, "architectures", None) or [""])[0]
+                if arch == "Qwen3MoeForCausalLM":
+                    from minisgl.models.qwen3_moe_afd import (
+                        Qwen3AfdDenseRouterForCausalLM,
+                        Qwen3AfdExpertStage,
+                    )
+
+                    return Qwen3AfdDenseRouterForCausalLM, Qwen3AfdExpertStage
+                if arch == "MiniMaxM2ForCausalLM":
+                    from minisgl.models.minimax_m2_afd import (
+                        MiniMaxM2AfdDenseRouterForCausalLM,
+                        MiniMaxM2AfdExpertStage,
+                    )
+
+                    return MiniMaxM2AfdDenseRouterForCausalLM, MiniMaxM2AfdExpertStage
+                if arch == "Glm4MoeForCausalLM":
+                    from minisgl.models.glm4_moe_afd import (
+                        Glm4AfdDenseRouterForCausalLM,
+                        Glm4AfdExpertStage,
+                    )
+
+                    return Glm4AfdDenseRouterForCausalLM, Glm4AfdExpertStage
+                raise RuntimeError(f"AFD AG/EG does not support architecture {arch!r}")
+
+            AfdDenseRouterForCausalLM, AfdExpertStage = _afd_stage_classes()
+
+            if self.role == "attention":
+                from minisgl.layers import set_rope_device
+
+                set_rope_device(runtime_state.device)
+                with torch.device("meta"), torch_dtype(config.dtype):
+                    model = AfdDenseRouterForCausalLM(mc)
+                full = _cast_full(load_weight(config.model_path, runtime_state.device, skip_expert_weights=True))
+                model.load_state_dict(extract_stage_state_dict(model, full))
+                del full
+                self._afd_ag_model = model
+                self._afd_sampler = Sampler(runtime_state.device, int(mc.vocab_size))
+            else:
+                # The AFD EG stage receives already-dispatched DeepEPM2N payloads
+                # from the outer adapter above. Its per-layer MoELayer objects are
+                # only expert weight holders plus DeepGEMM runners; AFD EG model
+                # classes explicitly disable MoELayer's internal A2A dispatcher.
+                with torch.device("meta"), torch_dtype(config.dtype):
+                    model = AfdExpertStage(mc)
+                full = _cast_full(
+                    load_weight(config.model_path, runtime_state.device, skip_non_expert_weights=True)
+                )
+                model.load_state_dict(extract_stage_state_dict(model, full))
+                del full
+                try:
+                    sd = model.state_dict()
+                    tensor_bytes = sum(int(t.numel() * t.element_size()) for t in sd.values())
+                    remote_layers = [
+                        layer
+                        for layer in getattr(model.model.layers, "op_list", [])
+                        if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts")
+                    ]
+                    shapes = []
+                    for idx in (0, len(remote_layers) - 1):
+                        if 0 <= idx < len(remote_layers):
+                            experts = remote_layers[idx].mlp.experts
+                            shapes.append(
+                                "layer_index="
+                                f"{idx} local_experts={int(getattr(experts, 'local_num_experts', -1))} "
+                                f"gate_up={tuple(experts.gate_up_proj.shape)}:{experts.gate_up_proj.dtype} "
+                                f"down={tuple(experts.down_proj.shape)}:{experts.down_proj.dtype}"
+                            )
+                    log_line(
+                        self.log_path,
+                        f"[{self.role} rank={self.tp_rank}] afd_eg_model_memory "
+                        f"state_tensors={len(sd)} state_bytes={tensor_bytes} "
+                        f"state_gib={tensor_bytes / (1024**3):.2f} "
+                        f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f} "
+                        f"cuda_reserved_gib={torch.cuda.memory_reserved() / (1024**3):.2f} "
+                        + " ".join(shapes),
+                        flush=True,
+                    )
+                except Exception as exc:
+                    log_line(
+                        self.log_path,
+                        f"[{self.role} rank={self.tp_rank}] afd_eg_model_memory_log_failed "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                if self._afd_moe_backend == "megamoe_m2n":
+                    # One-time per-layer requant of FP8 expert weights to the mega
+                    # kernel's per-32 UE8M0 interleaved format.
+                    layers = model.model.layers.op_list
+                    registered_layers = 0
+                    for layer_id, eg_layer in enumerate(layers):
+                        experts = eg_layer.mlp.experts
+                        shared_experts = getattr(eg_layer.mlp, "shared_experts", None)
+                        self._afd_adapter.register_eg_layer_weights(
+                            layer_id, experts, shared_experts=shared_experts
+                        )
+                        registered_layers += 1
+                        # MegaMoE keeps its transformed weights in the adapter. Drop
+                        # the Qwen-format tensors immediately; retaining both forms
+                        # OOMs on the 235B expert ranks.
+                        experts.gate_up_proj = None
+                        experts.gate_up_proj_scale = None
+                        experts.down_proj = None
+                        experts.down_proj_scale = None
+                        if shared_experts is not None:
+                            shared_experts.gate_up_proj.weight = None
+                            shared_experts.gate_up_proj.weight_scale = None
+                            shared_experts.down_proj.weight = None
+                            shared_experts.down_proj.weight_scale = None
+                        if layer_id % 4 == 3:
+                            torch.cuda.empty_cache()
+                    log_line(
+                        self.log_path,
+                        f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_weights "
+                        f"registered layers={registered_layers}/{len(layers)}",
+                        flush=True,
+                    )
+                    # MegaMoE runtime owns the transformed weights in the adapter.
+                    # Drop the ExpertStage object too; the EG persistent and
+                    # per-layer MegaMoE paths never call run_experts().
+                    self._afd_eg_model = None
+                    del layers
+                    del model
+                    torch.cuda.empty_cache()
+                else:
+                    self._afd_eg_model = model
 
         # Routing-distribution accumulator. Bound HERE and not in the graph
         # runner: capture must not record (see the A/B note in
@@ -762,6 +769,7 @@ class BaseAfdWorker:
                     bs_list=tuple(self.decode_graph_bs),
                     log_path=self.log_path,
                     label=f"{self.role} rank={self.tp_rank}",
+                    moe_layer_ids=self._moe_layer_ids,
                 )
 
         self._afd_initialized = True
@@ -773,6 +781,100 @@ class BaseAfdWorker:
             f"dp_fanin={dp_fanin}",
             flush=True,
         )
+
+    def _init_hybrid_runtime(self, hybrid, ag_size: int, eg_size: int, bucket: int, adapter_lanes: int) -> None:
+        """DeepSeek-V4 / Kimi-K3: MegaMoE adapter from the measured profile
+        contract, attention-stage model on AG ranks, MXFP4 routed (+shared)
+        experts registered directly into the adapter on EG ranks."""
+        import torch.distributed as dist
+        from minisgl.engine.sample import Sampler
+        from minisgl.models.afd_hybrid import attention_stage_class, dummy_eg_layer_weights
+        from minisgl.utils import torch_dtype
+
+        runtime_state = self.runtime_state
+        config = runtime_state.config
+        mc = config.model_config
+        self._afd_moe_backend = afd_env("MOE_BACKEND", "deepep")
+        if self._afd_moe_backend != "megamoe_m2n":
+            raise RuntimeError(
+                f"{mc.arch} AFD requires MINISGL_AFD_MOE_BACKEND=megamoe_m2n (measured MegaMoE stage)"
+            )
+        os.environ.setdefault("MINISGL_MEGAMOE_AG_SMS", "24")
+        from minisgl.moe.megamoe_m2n_afd import MegaMoEM2NAfdAdapter
+
+        mega_adapter = MegaMoEM2NAfdAdapter(
+            group=dist.group.WORLD,
+            ag_size=ag_size,
+            eg_size=eg_size,
+            num_max_dispatch_tokens_per_rank=bucket,
+            num_lanes=adapter_lanes,
+            **hybrid.adapter_kwargs(),
+        )
+        self._afd_adapters = [mega_adapter] * adapter_lanes
+        self._afd_adapter = mega_adapter
+        self._moe_layer_ids = tuple(hybrid.moe_layer_ids)
+        log_line(
+            self.log_path,
+            f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_adapter hybrid "
+            f"profile={hybrid.profile_key} hidden={hybrid.hidden} inter={hybrid.intermediate} "
+            f"experts={hybrid.num_experts} topk={hybrid.top_k} shared={hybrid.shared_experts_per_rank} "
+            f"rsf={hybrid.routed_scaling_factor} clamp={hybrid.activation_clamp} "
+            f"moe_layers={len(self._moe_layer_ids)} lanes={adapter_lanes} bucket={bucket}",
+            flush=True,
+        )
+        if self.role == "attention":
+            from minisgl.layers import set_rope_device
+
+            set_rope_device(runtime_state.device)
+            with torch.device("meta"), torch_dtype(config.dtype):
+                model = attention_stage_class(mc)(mc)
+            if config.use_dummy_weight:
+                from minisgl.models.dummy_init import init_dummy_state_dict
+
+                state = init_dummy_state_dict(model, runtime_state.device)
+            else:
+                from minisgl.models.ckpt_loaders import load_hybrid_checkpoint
+
+                state = load_hybrid_checkpoint(model, config.model_path, runtime_state.device, role="attention")
+            model.load_state_dict(state)
+            del state
+            post_load = getattr(model, "post_load", None)
+            if post_load is not None:
+                post_load()
+            self._afd_ag_model = model
+            self._afd_sampler = Sampler(runtime_state.device, int(mc.vocab_size))
+            torch.cuda.empty_cache()
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] afd_hybrid_ag_model loaded "
+                f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f}",
+                flush=True,
+            )
+        else:
+            eg_rank = int(mega_adapter.rank) - int(ag_size)
+            loader = None
+            if not config.use_dummy_weight:
+                from minisgl.models.ckpt_loaders import expert_layer_weights
+
+                loader = expert_layer_weights(config.model_path, hybrid, eg_rank, eg_size, runtime_state.device)
+            for layer_id in self._moe_layer_ids:
+                if loader is None:
+                    w = dummy_eg_layer_weights(hybrid, eg_rank, eg_size, layer_id, runtime_state.device)
+                else:
+                    w = loader(layer_id)
+                mega_adapter.register_eg_layer_fp4_packed_weights(layer_id, *w)
+                del w
+                if layer_id % 8 == 7:
+                    torch.cuda.empty_cache()
+            self._afd_eg_model = None
+            torch.cuda.empty_cache()
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_weights registered "
+                f"layers={len(self._moe_layer_ids)} eg_rank={eg_rank} "
+                f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f}",
+                flush=True,
+            )
 
     def warmup_afd_decode_graphs(self, bs_list) -> dict[str, Any]:
         """Capture the AG/EG decode graphs for each bucket. MUST be invoked on all

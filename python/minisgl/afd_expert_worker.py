@@ -216,14 +216,19 @@ def _run_eg_megamoe_pipeline_body(
     bucket: int,
     adapters,
     lane_streams: tuple[torch.cuda.Stream, ...],
+    layer_ids: tuple[int, ...] | None = None,
 ) -> None:
-    """Per-layer MegaMoE EG pipeline used when the persistent kernel is disabled."""
+    """Per-layer MegaMoE EG pipeline used when the persistent kernel is disabled.
+
+    ``layer_ids`` lists the MoE layers (models with dense layers skip those on
+    the expert side, matching the attention side's ``skip_moe``)."""
     num_layers = int(num_layers)
     num_mb = max(1, int(num_mb))
     bucket = int(bucket)
     adapter0 = adapters[0]
+    layers = tuple(layer_ids) if layer_ids is not None else tuple(range(num_layers))
 
-    for layer in range(num_layers):
+    for layer in layers:
         if adapter0.use_dual_lane(num_mb):
             with torch.cuda.stream(lane_streams[0]):
                 adapter0.eg_moe_dual(
@@ -264,9 +269,11 @@ class AfdEgDecodeGraphRunner:
         bs_list: tuple[int, ...],
         log_path: str,
         label: str,
+        moe_layer_ids: tuple[int, ...] | None = None,
     ) -> None:
         self.state = runtime_state
         self.expert_stage = expert_stage
+        self.moe_layer_ids = tuple(moe_layer_ids) if moe_layer_ids is not None else tuple(range(int(num_layers)))
         self.adapters = list(adapters)
         self.num_mb = max(1, int(num_mb))
         if len(self.adapters) < self.num_mb:
@@ -338,7 +345,7 @@ class AfdEgDecodeGraphRunner:
                 if num_mb > 2 and adapter.use_persistent(num_mb):
                     with torch.cuda.stream(lane_streams[0]):
                         adapter.eg_moe_persistent(
-                            self.num_layers,
+                            len(self.moe_layer_ids),
                             num_mb=num_mb,
                             expected_tokens_per_rank=mb_bs,
                         )
@@ -349,6 +356,7 @@ class AfdEgDecodeGraphRunner:
                         bucket=mb_bs,
                         adapters=adapters,
                         lane_streams=lane_streams,
+                        layer_ids=self.moe_layer_ids,
                     )
             else:
                 if payload is None:
@@ -483,9 +491,10 @@ class AfdExpertWorker(BaseAfdWorker):
         if not (_eg_uses_megamoe(adapter) and adapter.use_persistent(int(plan.num_mb))):
             return False
         lane_streams = tuple(self._afd_comm_streams) or (self.runtime_state.stream,)
+        moe_layers = getattr(self, "_moe_layer_ids", None)
         with torch.cuda.stream(lane_streams[0]):
             adapter.eg_moe_persistent(
-                int(self.num_layers),
+                len(moe_layers) if moe_layers is not None else int(self.num_layers),
                 num_mb=int(plan.num_mb),
                 expected_tokens_per_rank=int(bucket),
             )
@@ -517,6 +526,7 @@ class AfdExpertWorker(BaseAfdWorker):
                 bucket=bucket,
                 adapters=adapters,
                 lane_streams=lane_streams,
+                layer_ids=getattr(self, "_moe_layer_ids", None),
             )
             for stream in lane_streams:
                 self.runtime_state.stream.wait_stream(stream)

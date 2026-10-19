@@ -58,4 +58,6 @@ class EngineConfig:
 
     @property
     def distributed_addr(self) -> str:
-        return "tcp://127.0.0.1:2333"
+        import os
+
+        return f"tcp://127.0.0.1:{int(os.environ.get('MINISGL_DIST_PORT', '2333'))}"

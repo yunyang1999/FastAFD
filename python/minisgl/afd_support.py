@@ -575,6 +575,8 @@ def _supports_decode_graph_capture(
         return False
     backend = str(attention_backend)
     decode_backend = backend.split(",", 1)[1] if "," in backend else backend
+    if decode_backend in ("dsv4", "kimi"):
+        return True
     if decode_backend == "fi":
         return int(page_size) == 1
     if decode_backend == "trtllm":
@@ -588,6 +590,10 @@ def normalize_attention_backend_page_size(
 ) -> tuple[str, int]:
     backend = str(attention_backend)
     normalized_page_size = int(page_size)
+    if backend == "dsv4":
+        return backend, 128
+    if backend == "kimi":
+        return backend, 1
     if backend == "auto":
         backend = "trtllm" if is_sm100_supported() else "fi"
     if "trtllm" in backend and normalized_page_size not in (16, 32, 64):
