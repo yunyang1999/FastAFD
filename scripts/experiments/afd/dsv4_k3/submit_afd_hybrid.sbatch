@@ -8,7 +8,9 @@
 #
 # Required env: CONDA_ROOT, FASTAFD_ROOT, RUN_SCRIPT (path of a bash script)
 # Optional env: CONDA_ENV (default minisgl-cuda130), ENV_SETUP (a bash file
-#   sourced on every node after conda activation, e.g. cache directories)
+#   sourced on every node after conda activation, e.g. cache directories),
+#   HEAD_GPUS=1 (register the head node's GPUs too, so N nodes give 4N GPUs;
+#   e.g. 56A16F in one 18-node NVL72 domain; default 0 = GPU-less head)
 #
 #   CONDA_ROOT=... FASTAFD_ROOT=... RUN_SCRIPT=... \
 #   sbatch -N $((1 + GPU_NODES)) --segment=$((1 + GPU_NODES)) --account=... \
@@ -22,6 +24,7 @@ set -euo pipefail
 export CONDA_ROOT FASTAFD_ROOT RUN_SCRIPT
 export CONDA_ENV="${CONDA_ENV:-minisgl-cuda130}"
 export ENV_SETUP="${ENV_SETUP:-}"
+HEAD_GPUS="${HEAD_GPUS:-0}"
 
 nnodes=${SLURM_JOB_NUM_NODES:?not running under Slurm}
 mapfile -t nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
@@ -72,7 +75,7 @@ srun --ntasks="${nnodes}" --ntasks-per-node=1 --export=ALL bash -c "
 srun --nodes=1 --ntasks=1 -w "${head_node}" --export=ALL bash -c "
   $(declare -f activate); activate
   ray start --head --port=${ray_port} --dashboard-port=${dash_port} --dashboard-host=0.0.0.0 \
-    --num-gpus=0 --num-cpus=${cpus_per_node} --temp-dir=/tmp/ray-\${SLURM_JOB_ID}
+    --num-gpus=$(( HEAD_GPUS == 1 ? gpus_per_node : 0 )) --num-cpus=${cpus_per_node} --temp-dir=/tmp/ray-\${SLURM_JOB_ID}
   sleep infinity
 " &
 head_pid=$!
