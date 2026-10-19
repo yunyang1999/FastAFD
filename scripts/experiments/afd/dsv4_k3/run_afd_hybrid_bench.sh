@@ -108,7 +108,18 @@ echo "server ready after ${SECONDS}s"
 python "$SCRIPT_DIR/bench_client.py" --url "http://127.0.0.1:$PORT" \
   --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --attn-dp "$AFD_ATTN_DP_SIZE" \
   --batch-sizes "$BATCH_SIZES" --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
-  --timeout "${CLIENT_TIMEOUT:-1800}" --out "$RUN_DIR/sweep.json" | tee "$RUN_DIR/client.log"
+  --timeout "${CLIENT_TIMEOUT:-1800}" --out "$RUN_DIR/sweep.json" > "$RUN_DIR/client.log" 2>&1 &
+CLIENT_PID=$!
+# a worker whose hot loop died never answers; stop waiting on the client then
+while kill -0 "$CLIENT_PID" 2>/dev/null; do
+  if grep -qs "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log; then
+    echo "worker failure:" >&2; grep -hs -A3 "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log | tail -20 >&2
+    kill "$CLIENT_PID" 2>/dev/null; exit 3
+  fi
+  sleep 5
+done
+wait "$CLIENT_PID" || { echo "client failed" >&2; tail -20 "$RUN_DIR/client.log" >&2; exit 4; }
+cat "$RUN_DIR/client.log"
 
 stop_server
 trap - EXIT
