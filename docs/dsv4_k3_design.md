@@ -103,3 +103,35 @@ Each model gets its own pool + attention backend (selected by architecture);
 3. AFD reduced depth on 2 nodes, then full depth dummy weights (e.g. 56A16F), step
    time vs batch from the coordinator CPU trace.
 4. Real-weight name mapping / format conversion tested on single downloaded shards.
+
+## 6. Implementation status (branch `afd/dsv4-k3-models`)
+
+Code map:
+
+| area | files |
+|---|---|
+| config / registry | `models/config.py` (`deepseek_v4`, `kimi_k3` parsing), `utils/hf.py` (raw config.json, no remote code), `models/register.py` |
+| models (colocated) | `models/deepseek_v4.py`, `models/kimi_k3.py`, shared MoE helpers `models/moe_common.py` |
+| models (AFD attention stage) | `models/deepseek_v4_afd.py`, `models/kimi_k3_afd.py`, contract `models/afd_hybrid.py` |
+| kernels | `kernel/dsv4_triton.py` (mHC, q/kv norm+RoPE+quant-sim, inverse RoPE, compressor decode), `kernel/kda_triton.py` (short conv, KDA recurrence, gated RMSNorm), `kernel/kimi_triton.py` (attention residuals, SiTU) |
+| caches / backends | `kvcache/dsv4_pool.py`, `kvcache/kimi_pool.py`, `attention/dsv4.py`, `attention/kimi.py` |
+| weights | `models/dummy_init.py` (dummy), `models/ckpt_loaders.py` (real checkpoints) |
+| AFD wiring | `afd_worker_base.py` (`_init_hybrid_runtime`), `afd_attention_worker.py` (latent dispatch / post-combine hook), `afd_expert_worker.py` (MoE layer ids), `moe/megamoe_m2n_afd.py` (packed MXFP4 registration), `afd_worker_launcher.py` |
+| tests | `tests/dsv4_k3/` (kernels, numerics vs reference transcriptions, loader round trip / real shards) |
+| AFD bench | `scripts/experiments/afd/dsv4_k3/` (Ray bootstrap sbatch, sweep runner, client, analyzer, config-only model dirs) |
+
+Deviations / limits (current state):
+
+* MTP layers are not implemented (DSV4 `mtp.*` weights are skipped).
+* K3 routed experts use SiLU in the MegaMoE epilogue (both colocated MegaMoE and
+  AFD) because the measured `kimi_k3_fp4` stage has no SiTU; the torch executor
+  (`MINISGL_MOE_EXEC=torch`) keeps SiTU.
+* Colocated MegaMoE (`fp8_fp4_mega_moe`) faults with a synthetic shared slot at
+  EP=1, so colocated DSV4 runs the shared expert locally (FP8 GEMM); in AFD the
+  shared expert is on the expert workers as in the profile.
+* Prefill of the DSV4 compressor/indexer and the K3 KDA recurrence are
+  per-request / token-sequential kernels (correct, not tuned); decode is the
+  optimised path (CUDA graphs on both sides in AFD).
+* Prefix caching is not supported (`--cache-type naive`).
+* K3 tokenizer needs `tiktoken`, which the `minisgl-cuda130` env lacks; dummy
+  runs set `MINISGL_TOKENIZER_PATH` to another tokenizer directory.

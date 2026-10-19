@@ -25,7 +25,9 @@ def _quant_fp8_block(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, t
     wp[:out, :inp] = w.float()
     v = wp.view(po // block, block, pi // block, block)
     amax = v.abs().amax(dim=(1, 3), keepdim=True).clamp_min(1e-4)
-    s = amax / 448.0
+    # power-of-two (UE8M0) scales as in the DSV4 checkpoints; DeepGEMM would
+    # round arbitrary scales to UE8M0 anyway
+    s = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
     q = (v / s).to(torch.float8_e4m3fn)
     return q.view(po, pi)[:out, :inp].contiguous(), s.view(po // block, pi // block).contiguous()
 

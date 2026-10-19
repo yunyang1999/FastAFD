@@ -451,14 +451,19 @@ def real_forward(model_name: str, path: str, args) -> None:
 
         P, experts, shared = tn.dsv4_ref_params(m)
         rargs = tn.dsv4_ref_args(m)
-        for forced in (False, True):
+        # act_quant: reference emulates the FP8 activation quantisation of the
+        # official inference (and of the engine's FP8 GEMMs) in front of FP8 weights
+        for forced, act_quant in ((False, False), (True, False), (True, True)):
+            ref_dsv4.ACT_QUANT = act_quant
             ref = RefDSV4(P, rargs, experts, shared, max_seq_len=1024, dev=drv.device)
+            tag = (" (forced routing)" if forced else "") + (" (ref FP8 act-quant)" if act_quant else "")
             for s in range(args.steps + 1):
                 ref_dsv4.FORCE_IDS = {l: tn.tap_get(taps[s], f"L{l}.topk_ids") for l in range(rargs["n_layers"])} if forced else None
                 ids = torch.tensor([prompt] if s == 0 else [[nxt[s - 1]]], device=drv.device)
                 r = ref.forward(ids, 0 if s == 0 else L + s - 1)[0]
-                tn.cmp(f"real {model_name} full-forward logits{' (forced routing)' if forced else ''} call{s}", mine[s], r, logits=True)
+                tn.cmp(f"real {model_name} full-forward logits{tag} call{s}", mine[s], r, logits=True)
         ref_dsv4.FORCE_IDS = None
+        ref_dsv4.ACT_QUANT = False
     else:
         from ref_kimi import RefKimiK3
         import ref_kimi

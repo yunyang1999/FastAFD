@@ -18,6 +18,15 @@ import torch.nn.functional as F
 # {layer: LongTensor [T, k]}: use these routed-expert ids instead of the router's
 # own top-k (isolates routing flips caused by near-ties under random weights)
 FORCE_IDS: dict | None = None
+# Emulate the FP8 activation quantisation the official inference applies in
+# front of FP8-weight GEMMs (act_quant: block 128, UE8M0 scales) for the
+# attention projections and the shared expert. Routed experts are excluded
+# (the engine's torch MoE executor does not quantise activations).
+ACT_QUANT: bool = False
+
+
+def _aq(x):
+    return act_quant_inplace(x.clone(), 128) if ACT_QUANT else x
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +292,7 @@ class RefIndexer:
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
             self.compressor.freqs_cis = self.freqs_cis
-        q = F.linear(qr, self.P[f"{self.prefix}.wq_b.weight"])
+        q = F.linear(_aq(qr), self.P[f"{self.prefix}.wq_b.weight"])
         q = q.unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
@@ -342,11 +351,11 @@ class RefAttention:
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
-        qr = q = rmsnorm(F.linear(x, self.w("wq_a.weight")), self.w("q_norm.weight"), self.eps)
-        q = F.linear(q, self.w("wq_b.weight")).unflatten(-1, (self.n_heads, self.head_dim))
+        qr = q = rmsnorm(F.linear(_aq(x), self.w("wq_a.weight")), self.w("q_norm.weight"), self.eps)
+        q = F.linear(_aq(q), self.w("wq_b.weight")).unflatten(-1, (self.n_heads, self.head_dim))
         q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         apply_rotary_emb(q[..., -rd:], freqs_cis)
-        kv = F.linear(x, self.w("wkv.weight"))
+        kv = F.linear(_aq(x), self.w("wkv.weight"))
         kv = rmsnorm(kv, self.w("kv_norm.weight"), self.eps)
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         act_quant_inplace(kv[..., :-rd], 64)
@@ -378,7 +387,7 @@ class RefAttention:
         o = o.view(bsz, seqlen, self.n_groups, -1)
         wo_a = self.w("wo_a").view(self.n_groups, self.o_lora, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return F.linear(o.flatten(2), self.w("wo_b.weight"))
+        return F.linear(_aq(o.flatten(2)), self.w("wo_b.weight"))
 
 
 class RefMoE:
@@ -391,10 +400,10 @@ class RefMoE:
         self.experts = experts_bf16  # (w13 [E, 2I, D], w2 [E, D, I])
         self.shared = shared_bf16  # (w13 [2I, D], w2 [D, I])
 
-    def expert(self, x, w13, w2, weights=None):
+    def expert(self, x, w13, w2, weights=None, aq=False):
         dtype = x.dtype
         inter = w13.shape[0] // 2
-        h = F.linear(x, w13)
+        h = F.linear(_aq(x) if aq else x, w13)
         gate = h[..., :inter].float()
         up = h[..., inter:].float()
         lim = self.args["swiglu_limit"]
@@ -404,7 +413,8 @@ class RefMoE:
         x = F.silu(gate) * up
         if weights is not None:
             x = weights * x
-        return F.linear(x.to(dtype), w2)
+        x = x.to(dtype)
+        return F.linear(_aq(x) if aq else x, w2)
 
     def forward(self, x, input_ids):
         shape = x.size()
@@ -427,7 +437,7 @@ class RefMoE:
         for i in torch.unique(indices).tolist():
             idx, top = torch.where(indices == i)
             y[idx] += self.expert(x[idx], w13[i], w2[i], weights[idx, top, None])
-        y += self.expert(x, self.shared[0], self.shared[1])
+        y += self.expert(x, self.shared[0], self.shared[1], aq=True)
         return y.type_as(x).view(shape)
 
 

@@ -265,6 +265,17 @@ def numerics_dsv4(args):
             else:
                 rf = ref_f.forward(torch.tensor([[nxt[s - 1]]], device=dev), L + s - 1)[0]
             cmp(f"dsv4 L={L} full-forward logits (forced routing) call{s}", mine[s], rf, logits=True)
+        if args.fp8:  # reference with the FP8 activation quantisation of the FP8 GEMMs
+            ref_dsv4.ACT_QUANT = True
+            ref_f = RefDSV4(P, rargs, experts, shared, max_seq_len=1024, dev=dev)
+            for s in range(args.steps + 1):
+                ref_dsv4.FORCE_IDS = {l: tap_get(taps[s], f"L{l}.topk_ids") for l in range(rargs["n_layers"])}
+                if s == 0:
+                    rf = ref_f.forward(toks.view(1, -1), 0)[0]
+                else:
+                    rf = ref_f.forward(torch.tensor([[nxt[s - 1]]], device=dev), L + s - 1)[0]
+                cmp(f"dsv4 L={L} full-forward logits (forced routing, ref FP8 act-quant) call{s}", mine[s], rf, logits=True)
+            ref_dsv4.ACT_QUANT = False
         ref_dsv4.FORCE_IDS = None
         # module-level replay with my inputs
         for l in range(rargs["n_layers"]):
