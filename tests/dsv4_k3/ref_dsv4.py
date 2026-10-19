@@ -15,6 +15,10 @@ import math
 import torch
 import torch.nn.functional as F
 
+# {layer: LongTensor [T, k]}: use these routed-expert ids instead of the router's
+# own top-k (isolates routing flips caused by near-ties under random weights)
+FORCE_IDS: dict | None = None
+
 
 # ---------------------------------------------------------------------------
 # kernel.py equivalents
@@ -383,6 +387,7 @@ class RefMoE:
         self.prefix = f"layers.{layer_id}.ffn"
         self.args = args
         self.hash = layer_id < args["n_hash_layers"]
+        self.layer_id = layer_id
         self.experts = experts_bf16  # (w13 [E, 2I, D], w2 [E, D, I])
         self.shared = shared_bf16  # (w13 [2I, D], w2 [D, I])
 
@@ -410,6 +415,8 @@ class RefMoE:
         if not self.hash:
             scores = scores + self.P[f"{self.prefix}.gate.bias"]
             indices = scores.topk(self.args["topk"], dim=-1)[1]
+            if FORCE_IDS is not None and self.layer_id in FORCE_IDS:
+                indices = FORCE_IDS[self.layer_id].to(x.device).long()
         else:
             indices = self.P[f"{self.prefix}.gate.tid2eid"][input_ids.flatten()].long()
         weights = original.gather(1, indices)

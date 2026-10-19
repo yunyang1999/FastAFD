@@ -547,6 +547,7 @@ class DSV4MoE(BaseOP):
 
     def forward(self, x: torch.Tensor, executor: ColocatedMegaMoE | None) -> torch.Tensor:
         ids, w = self.gate.forward(x)
+        debug_taps.tap(f"L{self._layer_id}.topk_ids", ids)
         if executor is not None:
             # colocated MegaMoE runs the routed experts; the shared expert runs
             # locally (the synthetic shared slot of the colocated kernel faults

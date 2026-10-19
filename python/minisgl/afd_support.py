@@ -54,6 +54,12 @@ _RUNTIME_ENV_KEYS = (
     "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
     "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
     "MINISGL_NVTX_CPU_TRACE",
+    # DeepSeek-V4 / Kimi-K3 bring-up knobs (read inside the Ray workers)
+    "MINISGL_AFD_MEGAMOE_PROFILE",
+    "MINISGL_KDA_STATE_DTYPE",
+    "MINISGL_MOE_EXEC",
+    "MINISGL_ROPE_TABLE_LEN",
+    "MINISGL_TOKENIZER_PATH",
     # Real-routing capture. Ray merges runtime_env.env_vars on top of the
     # inherited environment, so this would probably propagate anyway -- but
     # "probably" here fails SILENTLY: expert_load.init() no-ops, the run

@@ -13,6 +13,9 @@ import torch
 import torch.nn.functional as F
 
 TAPS: list | None = None
+# {layer: LongTensor [T, k]}: use these routed-expert ids instead of the router's
+# own top-k (isolates routing flips caused by near-ties under random weights)
+FORCE_IDS: dict | None = None
 
 
 def _tap(name, t):
@@ -168,6 +171,8 @@ class RefKimiK3:
         scores = logits.sigmoid()
         sfc = scores + P[f"{pf}.gate.e_score_correction_bias"].unsqueeze(0)
         _, topk_idx = torch.topk(sfc, k=cfg["num_experts_per_token"], dim=-1, sorted=False)
+        if FORCE_IDS is not None and layer in FORCE_IDS:
+            topk_idx = FORCE_IDS[layer].to(x.device).long()
         topk_w = scores.gather(1, topk_idx)
         if cfg["num_experts_per_token"] > 1 and cfg.get("moe_renormalize", True):
             topk_w = topk_w / (topk_w.sum(-1, keepdim=True) + 1e-20)

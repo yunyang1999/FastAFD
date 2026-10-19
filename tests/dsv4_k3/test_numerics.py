@@ -253,6 +253,19 @@ def numerics_dsv4(args):
             r_logits.append(ref.forward(torch.tensor([[nxt[s]]], device=dev), L + s)[0])
         for s, (a, b) in enumerate(zip(mine, r_logits)):
             cmp(f"dsv4 L={L} full-forward logits call{s}", a, b, logits=True)
+        # same, with the reference forced onto my routed-expert ids (removes
+        # top-k flips from router near-ties, which random weights make common)
+        import ref_dsv4
+
+        ref_f = RefDSV4(P, rargs, experts, shared, max_seq_len=1024, dev=dev)
+        for s in range(args.steps + 1):
+            ref_dsv4.FORCE_IDS = {l: tap_get(taps[s], f"L{l}.topk_ids") for l in range(rargs["n_layers"])}
+            if s == 0:
+                rf = ref_f.forward(toks.view(1, -1), 0)[0]
+            else:
+                rf = ref_f.forward(torch.tensor([[nxt[s - 1]]], device=dev), L + s - 1)[0]
+            cmp(f"dsv4 L={L} full-forward logits (forced routing) call{s}", mine[s], rf, logits=True)
+        ref_dsv4.FORCE_IDS = None
         # module-level replay with my inputs
         for l in range(rargs["n_layers"]):
             ra = RefAttention(P, l, rargs, 1024, dev)
@@ -313,6 +326,13 @@ def numerics_k3(args):
         ref_kimi.TAPS = None
         for s, (a, b) in enumerate(zip(mine, r_logits)):
             cmp(f"k3 L={L} full-forward logits call{s}", a, b, logits=True)
+        # same, with the reference forced onto my routed-expert ids
+        ref_f = RefKimiK3(P, cfg, experts, dev)
+        for s in range(args.steps + 1):
+            ref_kimi.FORCE_IDS = {l: tap_get(taps[s], f"L{l}.topk_ids") for l in experts}
+            ids_s = torch.tensor(prompt if s == 0 else [nxt[s - 1]], device=dev)
+            cmp(f"k3 L={L} full-forward logits (forced routing) call{s}", mine[s], ref_f.forward(ids_s)[0], logits=True)
+        ref_kimi.FORCE_IDS = None
         # per-layer divergence in the full forward + routing-set agreement
         for c in (0, 1):
             for l in range(cfg["num_hidden_layers"]):

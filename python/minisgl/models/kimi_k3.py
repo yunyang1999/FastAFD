@@ -293,8 +293,9 @@ class KimiLatentMoE(BaseOP):
             y = y + shared
         return y
 
-    def forward(self, x: torch.Tensor, executor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, executor, layer_id: int = -1) -> torch.Tensor:
         ids, w = self.gate.forward(x)
+        debug_taps.tap(f"L{layer_id}.topk_ids", ids)
         latent = self.routed_expert_down_proj.forward(x)
         shared = self.shared_experts.forward(x) if self.shared_experts is not None else None
         if executor is not None:
@@ -379,7 +380,7 @@ class KimiDecoderLayer(BaseOP):
         h, res = self.attention_part(res)
         debug_taps.tap(f"L{self.layer_id}.moe_in", h)
         if self.block_sparse_moe is not None:
-            m = self.block_sparse_moe.forward(h, executor)
+            m = self.block_sparse_moe.forward(h, executor, self.layer_id)
         else:
             m = self.mlp.forward(h)
         debug_taps.tap(f"L{self.layer_id}.moe_out", m)
