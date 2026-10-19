@@ -108,7 +108,7 @@ echo "server ready after ${SECONDS}s"
 python "$SCRIPT_DIR/bench_client.py" --url "http://127.0.0.1:$PORT" \
   --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --attn-dp "$AFD_ATTN_DP_SIZE" \
   --batch-sizes "$BATCH_SIZES" --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
-  --out "$RUN_DIR/sweep.json" | tee "$RUN_DIR/client.log"
+  --timeout "${CLIENT_TIMEOUT:-1800}" --out "$RUN_DIR/sweep.json" | tee "$RUN_DIR/client.log"
 
 stop_server
 trap - EXIT

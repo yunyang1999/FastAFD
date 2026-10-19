@@ -106,10 +106,12 @@ class DSV4AttnBackend(BaseAttnBackend):
         tok_table = torch.tensor(tok_table_l, **CPU).to(dev, non_blocking=True)
         tok_cached = torch.tensor(tok_cached_l, **CPU).to(dev, non_blocking=True)
         cu = torch.tensor(cu_l, **CPU).to(dev, non_blocking=True)
-        positions = getattr(batch, "positions", None)
-        if positions is None:  # graph capture: metadata is rebuilt from real batches at replay
-            positions = torch.zeros(T, dtype=torch.int32, device=dev)
-        pos = positions.to(torch.int32)
+        # positions from the requests themselves: AFD builds one metadata object
+        # per microbatch from a request subset while batch.positions spans all
+        pos_l: list[int] = []
+        for req in reqs:
+            pos_l.extend(range(int(req.cached_len), int(req.device_len)))
+        pos = torch.tensor(pos_l, **CPU).to(dev, non_blocking=True)
         t_idx = torch.arange(T, device=dev, dtype=torch.int64)
         scratch_rows = pool.scratch_base + t_idx
         # window rows: positions p - j, j in [0, W)
