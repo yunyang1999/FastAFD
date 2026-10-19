@@ -218,3 +218,21 @@ sbatch -N 9 --segment=9 --account=<acct> --partition=<gb200 partition> --time=03
   uses the MXFP4-requantised weights that the MegaMoE expert workers run
   (colocated FP8 vs MXFP4 shared alone: 30 %), i.e. the difference is the
   shared-expert precision imposed by the measured MegaMoE stage.
+
+### AFD step time vs batch (full depth, dummy weights, GB200 NVL72)
+
+Median decode step from the coordinator trace; prompt 1024 tokens, 64 sampled
+output tokens, attention TP1, one server per batch size, `--afd-num-mb 2`
+unless noted, MegaMoE dispatch bucket 2048.
+
+| model, shape | 8 | 16 | 32 | 64 | 128 (per attention GPU) |
+|---|---:|---:|---:|---:|---:|
+| Kimi-K3, 16A16F | 73.4 ms | 76.3 | 82.5 | 100.8 | - |
+| DeepSeek-V4-Pro, 24A8F | 60.3 ms | 62.8 | 65.0 | 108.5 | 122.3 |
+| DeepSeek-V4-Flash, 28A4F | 33.3 ms | 34.3 | 35.3 | 52.7 | 59.5 |
+| DeepSeek-V4-Flash, 2A2F, mb=1 | 20.6 ms | 21.9 | 31.5 | 36.2 | 45.2 |
+
+These are end-to-end FastAFD steps of this implementation: the attention-side
+kernels (KDA, MLA, DSV4 compressor/indexer/sparse MLA, mHC) are functional,
+not tuned, so the small-batch floor is attention-side bound (K3: ~0.4 ms per
+layer and microbatch over 93 layers).
