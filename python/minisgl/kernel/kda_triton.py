@@ -40,6 +40,9 @@ def _short_conv_varlen_kernel(
     D,
     stride_x,
     stride_y,
+    stride_sr,  # state strides of the logical [R, D, KW-1] view
+    stride_sd,
+    stride_sj,
     KW: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -72,7 +75,7 @@ def _short_conv_varlen_kernel(
         sidx = (KW - 1) + src_t  # index into state for src_t in [-(KW-1), 0)
         use_state = (src_t < 0) & mt & (has_init != 0)
         sv = tl.load(
-            state_ptr + srow * D * (KW - 1) + offs_d[None, :] * (KW - 1) + tl.where(use_state, sidx, 0)[:, None],
+            state_ptr + srow * stride_sr + offs_d[None, :] * stride_sd + tl.where(use_state, sidx, 0)[:, None] * stride_sj,
             mask=use_state[:, None] & md[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -95,6 +98,9 @@ def _short_conv_state_update_kernel(
     init_ptr,
     D,
     stride_x,
+    stride_sr,
+    stride_sd,
+    stride_sj,
     KW: tl.constexpr,
     JP: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -121,11 +127,11 @@ def _short_conv_state_update_kernel(
     )
     old_idx = (KW - 1) + src  # old state index for src < 0
     use_old = (~from_x) & (old_idx >= 0) & (has_init != 0) & mj
-    sp = state_ptr + srow * D * (KW - 1) + offs_d[:, None] * (KW - 1)
-    sv = tl.load(sp + tl.where(use_old, old_idx, 0)[None, :], mask=md[:, None] & use_old[None, :], other=0.0)
+    sp = state_ptr + srow * stride_sr + offs_d[:, None] * stride_sd
+    sv = tl.load(sp + tl.where(use_old, old_idx, 0)[None, :] * stride_sj, mask=md[:, None] & use_old[None, :], other=0.0)
     newv = tl.where(from_x[None, :], xv.to(tl.float32), sv.to(tl.float32))
     tl.debug_barrier()
-    tl.store(sp + j[None, :], newv.to(state_ptr.dtype.element_ty), mask=md[:, None] & mj[None, :])
+    tl.store(sp + j[None, :] * stride_sj, newv.to(state_ptr.dtype.element_ty), mask=md[:, None] & mj[None, :])
 
 
 def short_conv_varlen(
@@ -137,7 +143,10 @@ def short_conv_varlen(
     has_initial_state: torch.Tensor,
     max_seqlen: int,
 ) -> torch.Tensor:
-    """x [T, D] -> silu(causal_conv(x)) [T, D]; updates conv_state[state_idx]."""
+    """x [T, D] -> silu(causal_conv(x)) [T, D]; updates conv_state[state_idx].
+
+    ``conv_state`` is the logical [R, D, KW-1] view (any strides; the pool stores
+    it as [R, KW-1, D], sglang's layout, and passes the transposed view)."""
     T, D = x.shape
     KW = weight.shape[-1]
     y = torch.empty_like(x)
@@ -146,12 +155,13 @@ def short_conv_varlen(
         return y
     BLOCK_T, BLOCK_D = 16, 256
     grid = (N, triton.cdiv(D, BLOCK_D), triton.cdiv(max(int(max_seqlen), 1), BLOCK_T))
+    sr, sd, sj = conv_state.stride()
     _short_conv_varlen_kernel[grid](
         x, weight, conv_state, y, cu_seqlens, state_idx, has_initial_state,
-        D, x.stride(0), y.stride(0), KW=KW, BLOCK_T=BLOCK_T, BLOCK_D=BLOCK_D, num_warps=4,
+        D, x.stride(0), y.stride(0), sr, sd, sj, KW=KW, BLOCK_T=BLOCK_T, BLOCK_D=BLOCK_D, num_warps=4,
     )
     _short_conv_state_update_kernel[(N, triton.cdiv(D, BLOCK_D))](
-        x, conv_state, cu_seqlens, state_idx, has_initial_state, D, x.stride(0),
+        x, conv_state, cu_seqlens, state_idx, has_initial_state, D, x.stride(0), sr, sd, sj,
         KW=KW, JP=triton.next_power_of_2(KW - 1), BLOCK_D=BLOCK_D, num_warps=4,
     )
     return y
@@ -167,6 +177,9 @@ def _short_conv_decode_kernel(
     D,
     stride_x,
     stride_y,
+    stride_sr,
+    stride_sd,
+    stride_sj,
     KW: tl.constexpr,
     JP: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -179,7 +192,7 @@ def _short_conv_decode_kernel(
     j = tl.arange(0, JP)
     mj = j < (KW - 1)
     m2 = md[:, None] & mj[None, :]
-    sp = state_ptr + srow * D * (KW - 1) + offs[:, None] * (KW - 1) + j[None, :]
+    sp = state_ptr + srow * stride_sr + offs[:, None] * stride_sd + j[None, :] * stride_sj
     st = tl.load(sp, mask=m2, other=0.0).to(tl.float32)  # [BD, JP]
     xv = tl.load(x_ptr + b * stride_x + offs, mask=md, other=0.0).to(tl.float32)
     w_hist = tl.load(w_ptr + offs[:, None] * KW + j[None, :], mask=m2, other=0.0).to(tl.float32)
@@ -189,7 +202,7 @@ def _short_conv_decode_kernel(
     # shift state left by one and append x
     # new[j] = old[j+1] for j < KW-2; new[KW-2] = x
     nxt = tl.load(
-        state_ptr + srow * D * (KW - 1) + offs[:, None] * (KW - 1) + tl.minimum(j + 1, KW - 2)[None, :],
+        state_ptr + srow * stride_sr + offs[:, None] * stride_sd + tl.minimum(j + 1, KW - 2)[None, :] * stride_sj,
         mask=m2,
         other=0.0,
     ).to(tl.float32)
@@ -207,8 +220,9 @@ def short_conv_decode(
     if B == 0:
         return y
     BLOCK_D = 256
+    sr, sd, sj = conv_state.stride()
     _short_conv_decode_kernel[(B, triton.cdiv(D, BLOCK_D))](
-        x, weight, conv_state, y, state_idx, D, x.stride(0), y.stride(0),
+        x, weight, conv_state, y, state_idx, D, x.stride(0), y.stride(0), sr, sd, sj,
         KW=KW, JP=triton.next_power_of_2(KW - 1), BLOCK_D=BLOCK_D, num_warps=4,
     )
     return y

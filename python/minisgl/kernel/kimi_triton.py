@@ -87,11 +87,12 @@ def _situ_mul_kernel(x_ptr, y_ptr, stride_x, stride_y, I, beta, lbeta, HAS_LB: t
     tl.store(y_ptr + t * stride_y + offs, (a * u).to(y_ptr.dtype.element_ty), mask=m)
 
 
-def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
-    """x [T, 2I] (gate | up) -> [T, I]."""
+def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: float | None, out_dtype: torch.dtype | None = None) -> torch.Tensor:
+    """x [T, 2I] (gate | up; rows may be strided, bf16 or fp32) -> [T, I]."""
     T, two_i = x.shape
     I = two_i // 2
-    y = torch.empty((T, I), dtype=x.dtype, device=x.device)
+    assert x.stride(1) == 1
+    y = torch.empty((T, I), dtype=out_dtype or x.dtype, device=x.device)
     if T == 0:
         return y
     BLOCK = 1024

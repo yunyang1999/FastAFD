@@ -4,7 +4,7 @@
   k_rot 64, token-slot indexed, ``page_size = 1``).
 * KDA layers: recurrent state ``ssm[i]`` ``[R, H_local, 128(V), 128(K)]`` (fp32 by
   default, ``MINISGL_KDA_STATE_DTYPE=bf16`` halves it) and short-conv state
-  ``conv[i]`` ``[R, 3*H_local*128, 3]`` bf16, indexed by request table slot.
+  ``conv[i]`` ``[R, 3, 3*H_local*128]`` bf16 (sglang layout), indexed by request table slot.
 """
 
 from __future__ import annotations
@@ -83,12 +83,17 @@ class KimiKVPool(BaseKVCachePool):
         for i, l in enumerate(spec.kda_layers):
             self.layer_kind[l] = ("kda", i)
         row = spec.kv_lora_rank + spec.rope_dim
-        self.mla_kv = torch.zeros(len(spec.mla_layers), self.num_tokens, row, dtype=torch.bfloat16, device=device)
+        # trtllm-gen MLA views the cache as [pages, 1, page_size, 576] and wants a
+        # page count that is a multiple of 128 / page_size: pad to 128 rows
+        rows = (self.num_tokens + 127) // 128 * 128
+        self.mla_kv = torch.zeros(len(spec.mla_layers), rows, row, dtype=torch.bfloat16, device=device)
         d = spec.kda_head_dim
         R = self.num_req_slots
         self.ssm = torch.zeros(len(spec.kda_layers), R, spec.kda_heads_local, d, d, dtype=kda_state_dtype(), device=device)
+        # [layers, R, KW-1, conv_dim]: sglang's conv-state layout (feature dim
+        # contiguous); kernels take the transposed [R, conv_dim, KW-1] view
         self.conv = torch.zeros(
-            len(spec.kda_layers), R, spec.conv_dim, spec.conv_kernel - 1, dtype=torch.bfloat16, device=device
+            len(spec.kda_layers), R, spec.conv_kernel - 1, spec.conv_dim, dtype=torch.bfloat16, device=device
         )
 
     def mla_cache(self, layer_id: int) -> torch.Tensor:

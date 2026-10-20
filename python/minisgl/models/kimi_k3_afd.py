@@ -32,8 +32,7 @@ class KimiK3AfdAttention(BaseOP):
 
     def post_load(self, **_) -> None:
         for layer in self.model.layers.op_list:
-            if not layer.is_kda:
-                layer.self_attn._absorb()
+            layer.prepare()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> ModelStageState:
         return ModelStageState(hidden_states=self.model.embed_tokens.forward(input_ids), residual=None)
@@ -54,9 +53,7 @@ class KimiK3AfdAttention(BaseOP):
         if layer.block_sparse_moe is None:
             return K3TopK(topk_ids=None, topk_weights=None, skip_moe=True, local_output=layer.mlp.forward(hidden))
         moe = layer.block_sparse_moe
-        ids, w = moe.gate.forward(hidden)
-        latent = moe.routed_expert_down_proj.forward(hidden)
-        shared = moe.shared_experts.forward(hidden) if moe.shared_experts is not None else None
+        ids, w, latent, shared = moe.front(hidden)
         return K3TopK(
             topk_ids=ids,
             topk_weights=w,

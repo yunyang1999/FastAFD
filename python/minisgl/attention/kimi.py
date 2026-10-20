@@ -1,8 +1,15 @@
-"""Attention backend for Kimi-K3: FA2 MLA (absorbed, NoPE) + KDA metadata."""
+"""Attention backend for Kimi-K3: MLA (absorbed, NoPE) + KDA metadata.
+
+Decode MLA runs flashinfer's trtllm-gen MLA kernel on a paged BF16 latent cache
+(page size 64), the kernel sglang 0.5.18 selects on SM100 (``trtllm_mla``).
+flashinfer 0.6.6 takes the TP1/TP2 head counts (96 / 48) in one call; larger
+counts are split into supported chunks. Prefill (and MINISGL_K3_MLA_DECODE=fa2) uses the FA2 MLA wrapper.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
@@ -30,6 +37,8 @@ class KimiMetadata(BaseAttnMetadata):
     kv_indices: torch.Tensor
     wrapper: object | None = None
     planned: bool = False
+    block_tables: torch.Tensor | None = None  # trtllm decode: [B, NP] int32 page ids
+    seq_lens: torch.Tensor | None = None  # trtllm decode: [B] int32 kv lengths
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -52,6 +61,18 @@ class KimiAttnBackend(BaseAttnBackend):
         self.scale = (int(d["qk_nope_head_dim"]) + int(d["qk_rope_head_dim"])) ** -0.5
         self.workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         self.wrapper = BatchMLAPagedAttentionWrapper(self.workspace, backend="fa2")
+        self.page_size = int(ctx.page_size)
+        self.max_seq_len = int(ctx.page_table.shape[1])
+        self.use_trtllm = (
+            os.environ.get("MINISGL_K3_MLA_DECODE", "sglang").lower() == "sglang" and self.page_size in (32, 64)
+        )
+        if self.use_trtllm:
+            # trtllm-gen requires a multiple of 128/page_size block-table columns
+            mult = 128 // self.page_size
+            npg = (self.max_seq_len + self.page_size - 1) // self.page_size
+            self.max_pages = (npg + mult - 1) // mult * mult
+            self.trtllm_ws = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+            self.head_chunks = trtllm_mla_head_chunks(self.num_heads)
         self.graph_wrappers: Dict[int, object] = {}
         self._capture_meta: Dict[int, KimiMetadata] = {}
         self._capture_bufs: Dict[str, torch.Tensor] = {}
@@ -79,9 +100,21 @@ class KimiAttnBackend(BaseAttnBackend):
         table = [int(r.table_idx) for r in reqs]
         tbl = torch.tensor(table, **CPU).to(dev, non_blocking=True)
         init = torch.tensor([1 if int(r.cached_len) > 0 else 0 for r in reqs], **CPU).to(dev, non_blocking=True)
-        kv_indices = (
-            torch.cat([page_table[t, :n] for t, n in zip(table, kv_lens)]) if reqs else page_table.new_empty(0)
-        )
+        is_decode = bool(batch.is_decode)
+        if is_decode and self.use_trtllm:
+            # paged decode: page ids from the token-slot page table (slot // P)
+            kv_indices = page_table.new_empty(0)
+            P = self.page_size
+            bt = torch.div(page_table[:, : self.max_pages * P : P][tbl.long()], P, rounding_mode="floor")
+            if bt.shape[1] < self.max_pages:
+                bt = torch.nn.functional.pad(bt, (0, self.max_pages - bt.shape[1]))
+            block_tables = bt.to(torch.int32)
+            seq_lens = kvlen_cpu.to(dev, non_blocking=True)
+        else:
+            kv_indices = (
+                torch.cat([page_table[t, :n] for t, n in zip(table, kv_lens)]) if reqs else page_table.new_empty(0)
+            )
+            block_tables = seq_lens = None
         return KimiMetadata(
             is_decode=bool(batch.is_decode),
             num_tokens=cu_q[-1],
@@ -94,6 +127,8 @@ class KimiAttnBackend(BaseAttnBackend):
             kv_len_cpu=kvlen_cpu,
             kv_indices=kv_indices,
             wrapper=self.wrapper,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
         )
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -122,11 +157,31 @@ class KimiAttnBackend(BaseAttnBackend):
 
     def mla_attn(self, layer_id: int, q_abs: torch.Tensor, q_rope: torch.Tensor) -> torch.Tensor:
         md = get_global_ctx().batch.attn_metadata
+        if md.block_tables is not None:
+            return self._trtllm_decode(layer_id, q_abs, q_rope, md)
         self._plan(md)
         cache = self.pool.mla_cache(layer_id)
         ckv = cache[:, : self.kv_lora].unsqueeze(1)
         kpe = cache[:, self.kv_lora :].unsqueeze(1)
         return md.wrapper.run(q_abs, q_rope, ckv, kpe)
+
+    def _trtllm_decode(self, layer_id: int, q_abs: torch.Tensor, q_rope: torch.Tensor, md: KimiMetadata) -> torch.Tensor:
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+        B, H, _ = q_abs.shape
+        q = torch.cat([q_abs, q_rope], dim=-1)  # [B, H, 576]
+        cache = self.pool.mla_cache(layer_id).view(-1, 1, self.page_size, self.kv_lora + self.rope)
+        out = torch.empty((B, H, self.kv_lora), dtype=torch.bfloat16, device=q.device)
+        for h0, hn in self.head_chunks:
+            qc = q[:, h0 : h0 + hn].unsqueeze(1) if len(self.head_chunks) > 1 else q.unsqueeze(1)
+            o = trtllm_batch_decode_with_kv_cache_mla(
+                query=qc.contiguous(), kv_cache=cache, workspace_buffer=self.trtllm_ws,
+                qk_nope_head_dim=128, kv_lora_rank=self.kv_lora, qk_rope_head_dim=self.rope,
+                block_tables=md.block_tables, seq_lens=md.seq_lens, max_seq_len=self.max_seq_len,
+                bmm1_scale=self.scale, bmm2_scale=1.0,
+            )
+            out[:, h0 : h0 + hn] = o.view(B, hn, self.kv_lora)
+        return out
 
     # ------------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -156,9 +211,13 @@ class KimiAttnBackend(BaseAttnBackend):
         md.cu_seqlens_q = md.cu_seqlens_q.clone()
         md.state_idx = md.state_idx.clone()
         md.has_init = md.has_init.clone()
+        if md.block_tables is not None:
+            md.block_tables = md.block_tables.clone()
+            md.seq_lens = md.seq_lens.clone()
         self._capture_meta[bs] = md
         batch.attn_metadata = md
-        self._plan(md)
+        if md.block_tables is None:
+            self._plan(md)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         bs = batch.padded_size
@@ -168,6 +227,10 @@ class KimiAttnBackend(BaseAttnBackend):
         cap.state_idx.copy_(real.state_idx)
         cap.has_init.copy_(real.has_init)
         cap.cu_seqlens_q.copy_(real.cu_seqlens_q)
+        if cap.block_tables is not None:
+            cap.block_tables.copy_(real.block_tables)
+            cap.seq_lens.copy_(real.seq_lens)
+            return
         real.wrapper = self.graph_wrappers[bs]
         real.planned = False
         self._plan(real)
@@ -176,4 +239,22 @@ class KimiAttnBackend(BaseAttnBackend):
         raise RuntimeError("KimiAttnBackend is driven by the Kimi attention modules")
 
 
-__all__ = ["KimiAttnBackend", "KimiMetadata"]
+def trtllm_mla_head_chunks(num_heads: int) -> list[tuple[int, int]]:
+    """Split the local heads into counts the trtllm-gen MLA kernel accepts in one
+    call (MINISGL_K3_MLA_HEAD_CHUNKS overrides the supported set)."""
+    env = os.environ.get("MINISGL_K3_MLA_HEAD_CHUNKS", "")
+    if not env and num_heads <= 128:
+        return [(0, num_heads)]  # flashinfer 0.6.6 trtllm-gen takes 16..128 heads in one call
+    sup = [int(x) for x in (env or "128,64,32,16").split(",")]
+    chunks, h0, rem = [], 0, num_heads
+    for c in sorted(sup, reverse=True):
+        while rem >= c:
+            chunks.append((h0, c))
+            h0 += c
+            rem -= c
+    if rem:
+        raise ValueError(f"trtllm-gen MLA: cannot split {num_heads} heads into {sup}")
+    return chunks
+
+
+__all__ = ["KimiAttnBackend", "KimiMetadata", "trtllm_mla_head_chunks"]

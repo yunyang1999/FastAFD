@@ -117,6 +117,15 @@ class K3Args:
         return (self.n_layers + self.res_block - 1) // self.res_block if self.res_block else 0
 
 
+import os as _os
+
+# decode kernels: "sglang" (vendored sglang 0.5.18 decode chain) or "legacy"
+_KDA_DECODE_IMPL = _os.environ.get("MINISGL_K3_KDA_DECODE", "sglang").lower()
+_ATTN_RES_IMPL = _os.environ.get("MINISGL_K3_ATTN_RES", "sglang").lower()
+_ROUTER_IMPL = _os.environ.get("MINISGL_K3_ROUTER", "sglang").lower()
+_MOE_FRONT_IMPL = _os.environ.get("MINISGL_K3_MOE_FRONT", "sglang").lower()
+
+
 def _all_reduce(x: torch.Tensor) -> torch.Tensor:
     if get_tp_info().size > 1:
         return DistributedCommunicator().all_reduce(x)
@@ -163,30 +172,74 @@ class KimiDeltaAttention(BaseOP):
         self._D = D
         self._lb = args.lower_bound
         self._eps = args.eps
+        self._w_qkvg: torch.Tensor | None = None
+        self._w_fab: torch.Tensor | None = None
+
+    def merge_weights(self) -> None:
+        """sglang's KDA projection layout: q|k|v|g as one GEMM, f_a|b as one small
+        GEMM. The original modules keep views into the merged buffers."""
+        if self._w_qkvg is not None:
+            return
+        w = torch.cat([self.qkv_proj.weight, self.g_proj.weight], dim=0)
+        n = self.qkv_proj.weight.shape[0]
+        self.qkv_proj.weight, self.g_proj.weight = w[:n], w[n:]
+        self._w_qkvg = w
+        wf = torch.cat([self.f_a_proj.weight, self.b_proj.weight], dim=0)
+        nf = self.f_a_proj.weight.shape[0]
+        self.f_a_proj.weight, self.b_proj.weight = wf[:nf], wf[nf:]
+        self._w_fab = wf
+
+    def _projections(self, x: torch.Tensor):
+        if self._w_qkvg is None:
+            self.merge_weights()
+        H, D = self.h_local, self._D
+        y = F.linear(x, self._w_qkvg)
+        qkv, gate = y[:, : 3 * H * D], y[:, 3 * H * D :]
+        fab = F.linear(x, self._w_fab)
+        g_raw = self.f_b_proj.forward(fab[:, :D])
+        b_raw = fab[:, D:]
+        return qkv, gate, g_raw, b_raw
 
     @nvtx_annotate("KDA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from minisgl.kernel.kda_triton import gated_rmsnorm, kda_recurrent, short_conv_decode, short_conv_varlen
-
         ctx = get_global_ctx()
         md = ctx.batch.attn_metadata
-        ssm, conv = ctx.attn_backend.pool.kda_state(self.layer_id)
+        ssm, conv = ctx.attn_backend.pool.kda_state(self.layer_id)  # conv [R, KW-1, dim]
         T = x.shape[0]
         H, D = self.h_local, self._D
-        qkv = self.qkv_proj.forward(x)
-        g_raw = self.f_b_proj.forward(self.f_a_proj.forward(x))
-        b_raw = self.b_proj.forward(x)
-        gate = self.g_proj.forward(x)
+        qkv, gate, g_raw, b_raw = self._projections(x)
+        conv_t = conv.transpose(-1, -2)  # logical [R, dim, KW-1], dim contiguous
+        if md.is_decode and _KDA_DECODE_IMPL == "sglang":
+            # sglang 0.5.18 decode chain (unfused path, any head count):
+            # causal_conv1d_update -> KDA packed decode (CUDA for B >= 8, Triton
+            # below) -> sigmoid-gated RMSNorm
+            from minisgl.kernel.sgl_triton.causal_conv1d import causal_conv1d_update
+            from minisgl.kernel.sgl_triton.kda_decode import fused_recurrent_kda_packed_decode, layer_norm_gated_fwd
+
+            y = causal_conv1d_update(qkv, conv_t, self.conv_weight, None, activation="silu", conv_state_indices=md.state_idx)
+            o = torch.empty((T, 1, H, D), dtype=x.dtype, device=x.device)
+            fused_recurrent_kda_packed_decode(
+                mixed_qkv=y, a=g_raw.contiguous(), b=b_raw.contiguous(), A_log=self.A_log, dt_bias=self.dt_bias,
+                scale=D**-0.5, initial_state=ssm, out=o, ssm_state_indices=md.state_idx,
+                use_qk_l2norm_in_kernel=True, lower_bound=self._lb,
+            )
+            o, _, _, _ = layer_norm_gated_fwd(
+                o.view(T * H, D), gate.contiguous().view(T * H, D), self.o_norm.weight, None,
+                activation="sigmoid", eps=self._eps, is_rms_norm=True,
+            )
+            return self.o_proj.forward(o.view(T, H * D))
+        from minisgl.kernel.kda_triton import gated_rmsnorm, kda_recurrent, short_conv_decode, short_conv_varlen
+
         if md.is_decode:
-            y = short_conv_decode(qkv, self.conv_weight, conv, md.state_idx)
+            y = short_conv_decode(qkv, self.conv_weight, conv_t, md.state_idx)
         else:
-            y = short_conv_varlen(qkv, self.conv_weight, conv, md.cu_seqlens_q, md.state_idx, md.has_init, md.max_seqlen_q)
+            y = short_conv_varlen(qkv, self.conv_weight, conv_t, md.cu_seqlens_q, md.state_idx, md.has_init, md.max_seqlen_q)
         q, k, v = y[:, : H * D], y[:, H * D : 2 * H * D], y[:, 2 * H * D :]
         o = kda_recurrent(
             q, k, v, g_raw, b_raw, self.A_log, self.dt_bias, ssm, md.cu_seqlens_q, md.state_idx, md.has_init,
             num_heads=H, head_dim=D, scale=D**-0.5, lower_bound=self._lb,
         )
-        o = gated_rmsnorm(o.view(T * H, D), gate.view(T * H, D), self.o_norm.weight, self._eps)
+        o = gated_rmsnorm(o.view(T * H, D), gate.contiguous().view(T * H, D), self.o_norm.weight, self._eps)
         return self.o_proj.forward(o.view(T, H * D))
 
 
@@ -207,6 +260,16 @@ class KimiMLAAttention(BaseOP):
         self._a = args
         self._w_uk: torch.Tensor | None = None
         self._w_uv_t: torch.Tensor | None = None
+        self._w_a: torch.Tensor | None = None
+
+    def merge_weights(self) -> None:
+        """q_a | kv_a as one GEMM (sglang fused_qkv_a_proj_with_mqa); modules keep views."""
+        if self._w_a is not None:
+            return
+        w = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight], dim=0)
+        n = self.q_a_proj.weight.shape[0]
+        self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight = w[:n], w[n:]
+        self._w_a = w
 
     def _absorb(self) -> None:
         a = self._a
@@ -223,9 +286,13 @@ class KimiMLAAttention(BaseOP):
         H = self.h_local
         if self._w_uk is None:
             self._absorb()
-        q = self.q_b_proj.forward(self.q_a_layernorm.forward(self.q_a_proj.forward(x))).view(T, H, a.qk_nope + a.qk_rope)
+        if self._w_a is None:
+            self.merge_weights()
+        qa_kva = F.linear(x, self._w_a)
+        q_lat = qa_kva[:, : a.q_lora].contiguous()
+        ckv_kr = qa_kva[:, a.q_lora :]
+        q = self.q_b_proj.forward(self.q_a_layernorm.forward(q_lat)).view(T, H, a.qk_nope + a.qk_rope)
         q_nope, q_rope = q[..., : a.qk_nope], q[..., a.qk_nope :]
-        ckv_kr = self.kv_a_proj_with_mqa.forward(x)
         ckv = self.kv_a_layernorm.forward(ckv_kr[:, : a.kv_lora].contiguous())
         cache = backend.pool.mla_cache(self.layer_id)
         out_loc = ctx.batch.out_loc.long()
@@ -258,14 +325,30 @@ class K3TopK(NamedTuple):
 
 class KimiMoEGate(BaseOP):
     def __init__(self, args: K3Args):
-        self.weight = torch.empty(args.n_routed, args.dim, dtype=torch.float32)
+        self.weight = torch.empty(args.n_routed, args.dim, dtype=torch.bfloat16)  # checkpoint dtype
         self.e_score_correction_bias = torch.empty(args.n_routed, dtype=torch.float32)
         self._topk = args.topk
         self._renorm = args.renorm
         self._rsf = args.rsf
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        scores = torch.sigmoid(F.linear(x.float(), self.weight))
+        from .deepseek_v4 import linear_bf16_fp32
+
+        return self.route(linear_bf16_fp32(x, self.weight))
+
+    def route(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """fp32 router logits -> (ids int32 [T,k], weights fp32 [T,k] incl. rsf):
+        sigmoid + correction-bias top-k, renormalised (sglang's CUDA radix router
+        for K3 shapes)."""
+        if _ROUTER_IMPL == "sglang":
+            from minisgl.kernel.sgl_triton.moe_router import moe_fused_gate
+
+            w, ids = moe_fused_gate(
+                logits, self.e_score_correction_bias, self._topk, scoring_func="sigmoid",
+                renormalize=self._topk > 1 and self._renorm,
+            )
+            return ids, (w * self._rsf if self._rsf != 1.0 else w)
+        scores = torch.sigmoid(logits)
         ids = torch.topk(scores + self.e_score_correction_bias, self._topk, dim=-1, sorted=False).indices
         w = scores.gather(1, ids)
         if self._topk > 1 and self._renorm:
@@ -286,6 +369,8 @@ class KimiLatentMoE(BaseOP):
         self._args = args
         self._offset = tp.rank * self.n_local
         self._act = ActivationSpec("situ", beta=args.situ_beta, linear_beta=args.situ_lbeta)
+        self._w_front: torch.Tensor | None = None
+        self._front_split = (0, 0)
 
     def post_combine(self, y_latent: torch.Tensor, shared: torch.Tensor | None) -> torch.Tensor:
         y = self.routed_expert_up_proj.forward(self.routed_expert_norm.forward(y_latent))
@@ -293,11 +378,51 @@ class KimiLatentMoE(BaseOP):
             y = y + shared
         return y
 
+    def merge_front(self) -> None:
+        """sglang's merged MoE front: router | latent down-projection | shared
+        gate_up as one BF16 weight (FP32 GEMM output); modules keep views."""
+        if self._w_front is not None:
+            return
+        parts = [self.gate.weight, self.routed_expert_down_proj.weight]
+        if self.shared_experts is not None:
+            parts.append(self.shared_experts.gate_up_proj.weight)
+        w = torch.cat(parts, dim=0)
+        o = 0
+        views = []
+        for p_ in parts:
+            views.append(w[o : o + p_.shape[0]])
+            o += p_.shape[0]
+        self.gate.weight, self.routed_expert_down_proj.weight = views[0], views[1]
+        if self.shared_experts is not None:
+            self.shared_experts.gate_up_proj.weight = views[2]
+        self._w_front = w
+        self._front_split = (self.gate.weight.shape[0], self.routed_expert_down_proj.weight.shape[0])
+
+    def front(self, x: torch.Tensor):
+        """-> (ids, weights, latent bf16, shared-expert output or None)."""
+        if _MOE_FRONT_IMPL != "sglang":
+            ids, w = self.gate.forward(x)
+            latent = self.routed_expert_down_proj.forward(x)
+            shared = self.shared_experts.forward(x) if self.shared_experts is not None else None
+            return ids, w, latent, shared
+        from minisgl.kernel.kimi_triton import situ_and_mul
+
+        if self._w_front is None:
+            self.merge_front()
+        y = torch.mm(x, self._w_front.t(), out_dtype=torch.float32)
+        ne, nl = self._front_split
+        ids, w = self.gate.route(y[:, :ne])
+        latent = y[:, ne : ne + nl].to(x.dtype)
+        shared = None
+        if self.shared_experts is not None:
+            sh = self.shared_experts
+            a = situ_and_mul(y[:, ne + nl :], sh._beta, sh._lbeta, out_dtype=x.dtype)
+            shared = sh.down_proj.forward(a)
+        return ids, w, latent, shared
+
     def forward(self, x: torch.Tensor, executor, layer_id: int = -1) -> torch.Tensor:
-        ids, w = self.gate.forward(x)
+        ids, w, latent, shared = self.front(x)
         debug_taps.tap(f"L{layer_id}.topk_ids", ids)
-        latent = self.routed_expert_down_proj.forward(x)
-        shared = self.shared_experts.forward(x) if self.shared_experts is not None else None
         if executor is not None:
             y = executor(latent, ids, w, self.experts.megamoe())
         else:
@@ -341,39 +466,65 @@ class KimiDecoderLayer(BaseOP):
         self._a = args
         self._w_attn: torch.Tensor | None = None
         self._w_mlp: torch.Tensor | None = None
+        self._cw_attn: torch.Tensor | None = None
+        self._cw_mlp: torch.Tensor | None = None
+
+    def prepare(self) -> None:
+        """Post-load weight merges / absorption (must run before CUDA-graph capture)."""
+        if self.is_kda:
+            self.self_attn.merge_weights()
+        else:
+            self.self_attn._absorb()
+            self.self_attn.merge_weights()
+        if self.block_sparse_moe is not None:
+            self.block_sparse_moe.merge_front()
+        self._res_weights()
 
     def _res_weights(self):
         if self._w_attn is None:
             self._w_attn = (self.self_attention_res_norm.weight.float() * self.self_attention_res_proj.view(-1).float()).contiguous()
             self._w_mlp = (self.mlp_res_norm.weight.float() * self.mlp_res_proj.view(-1).float()).contiguous()
+            self._cw_attn = self._w_attn.to(torch.bfloat16)
+            self._cw_mlp = self._w_mlp.to(torch.bfloat16)
         return self._w_attn, self._w_mlp
+
+    def _aggregate(self, prefix, res: K3Residual, w32, cw16, norm: RMSNorm, write_prefix: bool = False) -> torch.Tensor:
+        """norm(attention-residual mix of [bank rows, prefix]) (sglang's fused TMA
+        kernel when covered, else the Triton reference + RMSNorm)."""
+        from minisgl.kernel import k3_attn_res
+
+        if _ATTN_RES_IMPL == "sglang" and k3_attn_res.covered(prefix, res.buf, res.nb):
+            return k3_attn_res.attn_res_fused_tma(
+                prefix, res.buf, cw16, norm.weight, res.nb, self._a.eps, write_prefix=write_prefix
+            )
+        from minisgl.kernel.kimi_triton import attn_res
+
+        res.buf[:, res.nb].copy_(prefix)
+        return norm.forward(attn_res(res.buf, res.nb + 1, w32, self._a.eps))
 
     def attention_part(self, res: K3Residual) -> tuple[torch.Tensor, K3Residual]:
         """From the layer input state up to the MLP input (post norm)."""
-        from minisgl.kernel.kimi_triton import attn_res
-
         w_attn, w_mlp = self._res_weights()
-        eps = self._a.eps
         prefix = res.prefix
         assert prefix is not None
+        boundary = bool(self._a.res_block and self.layer_id % self._a.res_block == 0)
         if res.nb > 0:
-            res.buf[:, res.nb].copy_(prefix)
-            hidden = attn_res(res.buf, res.nb + 1, w_attn, eps)
+            # both aggregation paths leave prefix in bank row nb (fused: write_prefix)
+            h = self._aggregate(prefix, res, w_attn, self._cw_attn, self.input_layernorm, write_prefix=boundary)
         else:
-            hidden = prefix
-        if self._a.res_block and self.layer_id % self._a.res_block == 0:
-            res.buf[:, res.nb].copy_(prefix)
+            h = self.input_layernorm.forward(prefix)
+        if boundary:
+            if res.nb == 0:
+                res.buf[:, 0].copy_(prefix)
             res.nb += 1
             prefix = None
-        h = self.input_layernorm.forward(hidden)
         debug_taps.tap(f"L{self.layer_id}.attn_in", h)
         h = self.self_attn.forward(h)
         debug_taps.tap(f"L{self.layer_id}.attn_out", h)
         prefix = h if prefix is None else prefix + h
-        res.buf[:, res.nb].copy_(prefix)
-        hidden = attn_res(res.buf, res.nb + 1, w_mlp, eps)
+        hidden = self._aggregate(prefix, res, w_mlp, self._cw_mlp, self.post_attention_layernorm)
         res.prefix = prefix
-        return self.post_attention_layernorm.forward(hidden), res
+        return hidden, res
 
     @nvtx_annotate("K3Layer_{}", layer_id_field="layer_id")
     def forward(self, res: K3Residual, executor) -> K3Residual:
@@ -405,10 +556,14 @@ class KimiK3Model(BaseOP):
         return K3Residual(buf=buf, nb=0, prefix=h)
 
     def final_hidden(self, res: K3Residual) -> torch.Tensor:
+        from minisgl.kernel import k3_attn_res
         from minisgl.kernel.kimi_triton import attn_res
 
         if self._w_out is None:
             self._w_out = (self.output_attn_res_norm.weight.float() * self.output_attn_res_proj.view(-1).float()).contiguous()
+            self._cw_out = self._w_out.to(torch.bfloat16)
+        if _ATTN_RES_IMPL == "sglang" and k3_attn_res.covered(res.prefix, res.buf, res.nb):
+            return k3_attn_res.attn_res_fused_tma(res.prefix, res.buf, self._cw_out, self.norm.weight, res.nb, self._args.eps)
         res.buf[:, res.nb].copy_(res.prefix)
         h = attn_res(res.buf, res.nb + 1, self._w_out, self._args.eps)
         return self.norm.forward(h)
@@ -432,8 +587,7 @@ class KimiK3ForCausalLM(BaseLLMModel):
     def post_load(self, *, max_tokens_per_rank: int) -> None:
         a = self.model._args
         for layer in self.model.layers.op_list:
-            if not layer.is_kda:
-                layer.self_attn._absorb()
+            layer.prepare()
         if moe_exec_backend() == "megamoe":
             self._executor = ColocatedMegaMoE(
                 num_routed=a.n_routed,
