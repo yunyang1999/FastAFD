@@ -26,7 +26,11 @@ def load_bench(d: str, core: bool) -> dict:
             rows = json.load(open(f))
         except Exception:
             continue
-        for r in rows or []:
+        if not isinstance(rows, list):
+            continue  # other JSONs in the run directory (numerics etc.)
+        for r in rows:
+            if not isinstance(r, dict) or "model" not in r:
+                continue
             if bool(r.get("mode") == "core") != core:
                 continue
             out[(r["model"], r["tp"], r["bs"], r["ctx"])] = r

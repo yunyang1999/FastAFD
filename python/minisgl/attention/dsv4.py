@@ -28,6 +28,17 @@ def _pad_to(x: int, a: int) -> int:
 
 
 @triton.jit
+def _pad_q_kernel(q_ptr, out_ptr, H, Hp, stride_t, stride_h, D: tl.constexpr, DP: tl.constexpr, BLOCK: tl.constexpr):
+    """out [T, Hp, DP] = q [T, H, D] zero-padded in heads and features (one pass)."""
+    r = tl.program_id(0)
+    t = r // Hp
+    h = r - t * Hp
+    j = tl.arange(0, BLOCK)
+    v = tl.load(q_ptr + t * stride_t + h * stride_h + j, mask=(j < D) & (h < H), other=0.0)
+    tl.store(out_ptr + r * DP + j, v, mask=j < DP)
+
+
+@triton.jit
 def _assemble_index_kernel(
     win_ptr,  # [T, W] int32 window rows (valid prefix of n_window)
     nwin_ptr,  # [T] int32
@@ -344,8 +355,9 @@ class DSV4AttnBackend(BaseAttnBackend):
         # heads; zero-padding the query heads to 128 selects the 2-CTA
         # high-throughput kernel, which wins once the batch x top-k is large
         Hp = 128 if (H < 128 and T * Kp >= (16384 if H >= 64 else 65536)) else H
-        q576 = torch.zeros((T, 1, Hp, 576), dtype=q.dtype, device=q.device)
-        q576[:, 0, :H, :D] = q
+        q576 = torch.empty((T, 1, Hp, 576), dtype=q.dtype, device=q.device)
+        if T:
+            _pad_q_kernel[(T * Hp,)](q, q576, H, Hp, q.stride(0), q.stride(1), D=D, DP=576, BLOCK=1024, num_warps=4)
         if Hp != H:
             key = (sinks.data_ptr(), Hp)
             sp = self._sinks_pad.get(key)
