@@ -54,7 +54,18 @@ class Req:
         self.device_len += 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
-        self.input_ids = torch.cat([self.input_ids, next_token])
+        # Amortised append into one preallocated host buffer per request. The previous
+        # torch.cat re-copied the whole sequence per request and decode step; beyond
+        # 32K elements ATen parallelises that copy over the OpenMP pool, which made the
+        # colocated scheduler host-bound at 32K context (~0.4 ms per request and step).
+        n = len(self.input_ids)
+        buf = getattr(self, "_ids_buf", None)
+        if buf is None or buf.numel() < n + 1:
+            buf = torch.empty(max(self.max_device_len, n + 1), dtype=self.input_ids.dtype)
+            buf[:n].copy_(self.input_ids)
+            self._ids_buf = buf
+        buf[n : n + 1].copy_(next_token)
+        self.input_ids = buf[: n + 1]
 
     @property
     def can_decode(self) -> bool:
