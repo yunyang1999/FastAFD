@@ -2,8 +2,8 @@
 
 Decode MLA runs flashinfer's trtllm-gen MLA kernel on a paged BF16 latent cache
 (page size 64), the kernel sglang 0.5.18 selects on SM100 (``trtllm_mla``).
-flashinfer 0.6.6 takes the TP1/TP2 head counts (96 / 48) in one call; larger
-counts are split into supported chunks. Prefill (and MINISGL_K3_MLA_DECODE=fa2) uses the FA2 MLA wrapper.
+Head counts that are not a power of two (TP1/TP2: 96 / 48) are zero-padded to
+128 / 64 so one call reads the KV once. Prefill (and MINISGL_K3_MLA_DECODE=fa2) uses the FA2 MLA wrapper.
 """
 
 from __future__ import annotations
@@ -169,18 +169,21 @@ class KimiAttnBackend(BaseAttnBackend):
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
         B, H, _ = q_abs.shape
-        q = torch.cat([q_abs, q_rope], dim=-1)  # [B, H, 576]
         cache = self.pool.mla_cache(layer_id).view(-1, 1, self.page_size, self.kv_lora + self.rope)
-        out = torch.empty((B, H, self.kv_lora), dtype=torch.bfloat16, device=q.device)
-        for h0, hn in self.head_chunks:
-            qc = q[:, h0 : h0 + hn].unsqueeze(1) if len(self.head_chunks) > 1 else q.unsqueeze(1)
+        out = torch.empty((B, H, self.kv_lora), dtype=torch.bfloat16, device=q_abs.device)
+        for h0, hn, hp in self.head_chunks:
+            # zero-padded query heads up to a count every trtllm-gen variant takes
+            # (the MLA kernels tile heads by 16/32/64/128); padded rows are dropped
+            q = torch.zeros((B, 1, hp, self.kv_lora + self.rope), dtype=torch.bfloat16, device=q_abs.device)
+            q[:, 0, :hn, : self.kv_lora] = q_abs[:, h0 : h0 + hn]
+            q[:, 0, :hn, self.kv_lora :] = q_rope[:, h0 : h0 + hn]
             o = trtllm_batch_decode_with_kv_cache_mla(
-                query=qc.contiguous(), kv_cache=cache, workspace_buffer=self.trtllm_ws,
+                query=q, kv_cache=cache, workspace_buffer=self.trtllm_ws,
                 qk_nope_head_dim=128, kv_lora_rank=self.kv_lora, qk_rope_head_dim=self.rope,
                 block_tables=md.block_tables, seq_lens=md.seq_lens, max_seq_len=self.max_seq_len,
                 bmm1_scale=self.scale, bmm2_scale=1.0,
             )
-            out[:, h0 : h0 + hn] = o.view(B, hn, self.kv_lora)
+            out[:, h0 : h0 + hn] = o.view(B, hp, self.kv_lora)[:, :hn]
         return out
 
     # ------------------------------------------------------------------
@@ -239,17 +242,26 @@ class KimiAttnBackend(BaseAttnBackend):
         raise RuntimeError("KimiAttnBackend is driven by the Kimi attention modules")
 
 
-def trtllm_mla_head_chunks(num_heads: int) -> list[tuple[int, int]]:
-    """Split the local heads into counts the trtllm-gen MLA kernel accepts in one
-    call (MINISGL_K3_MLA_HEAD_CHUNKS overrides the supported set)."""
+def trtllm_mla_head_chunks(num_heads: int) -> list[tuple[int, int, int]]:
+    """(first head, heads, padded heads) per trtllm-gen MLA call. Default: one call
+    with the heads zero-padded to the next power of two (96 -> 128, 48 -> 64; the
+    flashinfer 0.6.6 kernels reject non power-of-two head counts for some
+    variants); MINISGL_K3_MLA_HEAD_CHUNKS=64,32,... splits into exact chunks
+    instead (one KV pass per chunk)."""
     env = os.environ.get("MINISGL_K3_MLA_HEAD_CHUNKS", "")
-    if not env and num_heads <= 128:
-        return [(0, num_heads)]  # flashinfer 0.6.6 trtllm-gen takes 16..128 heads in one call
-    sup = [int(x) for x in (env or "128,64,32,16").split(",")]
+    if not env:
+        chunks, h0, rem = [], 0, num_heads
+        while rem:
+            hn = min(rem, 128)
+            chunks.append((h0, hn, max(16, 1 << (hn - 1).bit_length())))
+            h0 += hn
+            rem -= hn
+        return chunks
+    sup = [int(x) for x in env.split(",")]
     chunks, h0, rem = [], 0, num_heads
     for c in sorted(sup, reverse=True):
         while rem >= c:
-            chunks.append((h0, c))
+            chunks.append((h0, c, c))
             h0 += c
             rem -= c
     if rem:
