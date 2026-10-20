@@ -7,8 +7,9 @@
 * DeepGEMM (minisgl's vendored build): ``fp8_paged_mqa_logits`` and its schedule
   metadata over the paged FP8 indexer-key cache (64 entries x (128 FP8 + FP32
   scale) per page, values first then scales -- DeepGEMM's fused layout).
-* A Triton store for indexer keys into that cache (norm + RoPE + Hadamard +
-  per-token FP8 quant, matching the q-side quantisation).
+* sglang's ``fused_norm_rope_indexer`` (fused_norm_rope_v2) storing decode-time
+  compressed indexer keys into that cache (norm + RoPE + Hadamard butterfly +
+  per-token FP8 quant), and a Triton store with the same math for prefill.
 """
 
 from __future__ import annotations
@@ -268,6 +269,28 @@ def store_index_keys(
     )
 
 
+@functools.cache
+def _index_norm_rope_store_module():
+    args = cpp_args(torch.bfloat16, INDEX_DIM, 64, INDEX_BLOCK, supports_pdl(), 0, False)
+    return load_jit(
+        "dsv4_fused_norm_rope_v2_indexer", args,
+        cuda_files=["deepseek_v4/fused_norm_rope_v2.cuh"],
+        cuda_wrappers=[("forward", f"FusedNormRopeKernel<{args}>::forward")],
+    )
+
+
+def store_index_keys_decode(
+    keys: torch.Tensor, plan_d: torch.Tensor, norm_weight: torch.Tensor, eps: float, freqs: torch.Tensor,
+    rows: torch.Tensor, cache: torch.Tensor, ratio: int = 4,
+) -> None:
+    """Decode: pooled indexer keys [B, 128] bf16 of the requests whose group
+    completes (plan seq_len % ratio == 0) -> norm + RoPE at seq_len - ratio +
+    Hadamard + per-token FP8 quant into ``cache`` entries ``rows`` [B] int64."""
+    _index_norm_rope_store_module().forward(
+        keys, plan_d, norm_weight, float(eps), freqs, rows, cache.view(cache.shape[0], -1), True, int(ratio)
+    )
+
+
 def gather_index_keys(cache: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     """Dequantised keys [n, 128] bf16 of the given c4 rows (prefill path)."""
     pages = rows // INDEX_BLOCK
@@ -281,6 +304,7 @@ def gather_index_keys(cache: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
 
 __all__ = [
     "freqs_real", "fused_q_norm_rope", "fused_q_indexer_quant", "fused_rope_inplace", "plan_topk_v2",
-    "topk_transform_v2", "paged_mqa_schedule", "paged_mqa_logits", "store_index_keys", "gather_index_keys",
+    "topk_transform_v2", "paged_mqa_schedule", "paged_mqa_logits", "store_index_keys", "store_index_keys_decode",
+    "gather_index_keys",
     "INDEX_BLOCK", "INDEX_ROW_BYTES",
 ]

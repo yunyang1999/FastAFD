@@ -1,7 +1,9 @@
 """KV cache / state pool for DeepSeek-V4 (SWA + compressed sparse attention).
 
-Per layer ``l`` one KV buffer ``kv[l]`` of rows of 576 bf16 values (the 512-d
-MQA latent stored as MLA ``ckv`` plus a zero 64-d ``kpe``) laid out as
+Per layer ``l`` one KV buffer ``kv[l]`` of rows of 576 values (the 512-d MQA
+latent stored as MLA ``ckv`` plus a zero 64-d ``kpe``), FP8 e4m3 by default
+(``MINISGL_DSV4_KV_DTYPE=fp8``, per-tensor scale 1, read by the FP8 trtllm-gen
+sparse MLA kernels) or BF16 (``MINISGL_DSV4_KV_DTYPE=bf16``), laid out as
 
     [ SWA ring:  R x window rows      row = table_idx * window + pos % window ]
     [ scratch:   S rows               this forward's new tokens (row = S0 + i) ]
@@ -18,6 +20,7 @@ must be 256 so a c4 page never spans two token pages).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -26,6 +29,16 @@ from .base import BaseKVCachePool
 
 ROW_DIM = 576  # 512 latent + 64 (zero) rope slot of the MLA kernel layout
 ROW_ALIGN = 64  # trtllm-gen MLA kernel views the cache as [-1, 1, 64, 576]
+
+
+def kv_row_dtype() -> torch.dtype:
+    """Element type of the attention KV rows (``MINISGL_DSV4_KV_DTYPE``: fp8 | bf16)."""
+    v = os.environ.get("MINISGL_DSV4_KV_DTYPE", "fp8").strip().lower()
+    if v in ("fp8", "fp8_e4m3", "e4m3"):
+        return torch.float8_e4m3fn
+    if v in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    raise ValueError(f"MINISGL_DSV4_KV_DTYPE must be fp8 or bf16, got {v!r}")
 
 
 def _align(x: int, a: int) -> int:
@@ -39,6 +52,11 @@ class DSV4CacheSpec:
     window: int
     head_dim: int
     index_head_dim: int
+    kv_dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def row_bytes(self) -> int:
+        return ROW_DIM * torch.empty((), dtype=self.kv_dtype).element_size()
 
     @classmethod
     def from_model_config(cls, mc) -> "DSV4CacheSpec":
@@ -51,6 +69,7 @@ class DSV4CacheSpec:
             window=int(d.get("sliding_window", 128)),
             head_dim=int(d["head_dim"]),
             index_head_dim=int(d["index_head_dim"]),
+            kv_dtype=kv_row_dtype(),
         )
 
     def coff(self, ratio: int) -> int:
@@ -60,7 +79,7 @@ class DSV4CacheSpec:
         b = 0.0
         for r in self.ratios:
             if r:
-                b += ROW_DIM * 2 / r
+                b += self.row_bytes / r
             if r == 4:
                 b += (self.index_head_dim + 4) / 4  # FP8 key + FP32 scale per c4 entry
         return b
@@ -68,7 +87,7 @@ class DSV4CacheSpec:
     def bytes_per_request(self) -> int:
         b = 0
         for r in self.ratios:
-            b += self.window * ROW_DIM * 2
+            b += self.window * self.row_bytes
             if r:
                 c = self.coff(r)
                 b += 2 * (c * r) * (c * self.head_dim) * 4
@@ -77,7 +96,7 @@ class DSV4CacheSpec:
         return b
 
     def fixed_bytes(self, scratch_rows: int) -> int:
-        return self.num_layers * scratch_rows * ROW_DIM * 2
+        return self.num_layers * scratch_rows * self.row_bytes
 
 
 class DSV4KVPool(BaseKVCachePool):
@@ -107,6 +126,7 @@ class DSV4KVPool(BaseKVCachePool):
         self.comp_base = self.swa_rows + self.scratch_rows
         self._device = device
         self._dtype = torch.bfloat16
+        self.kv_dtype = spec.kv_dtype
         self.kv: list[torch.Tensor] = []
         self.idx_keys: list[torch.Tensor | None] = []
         self.state_kv: list[torch.Tensor | None] = []
@@ -118,7 +138,7 @@ class DSV4KVPool(BaseKVCachePool):
         for r in spec.ratios:
             comp_rows = self.num_tokens // r if r else 0
             rows = _align(self.comp_base + comp_rows, ROW_ALIGN)
-            self.kv.append(torch.zeros(rows, ROW_DIM, dtype=torch.bfloat16, device=device))
+            self.kv.append(torch.zeros(rows, ROW_DIM, dtype=self.kv_dtype, device=device))
             if r:
                 c = spec.coff(r)
                 self.state_kv.append(torch.zeros(R, c * r, c * d, dtype=torch.float32, device=device))
@@ -173,4 +193,4 @@ class DSV4KVPool(BaseKVCachePool):
         return {"kv_bytes": tot, "indexer_key_bytes": tot_idx, "compressor_state_bytes": tot_state}
 
 
-__all__ = ["DSV4KVPool", "DSV4CacheSpec", "ROW_DIM"]
+__all__ = ["DSV4KVPool", "DSV4CacheSpec", "ROW_DIM", "kv_row_dtype"]

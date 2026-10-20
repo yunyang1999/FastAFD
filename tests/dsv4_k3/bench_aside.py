@@ -262,8 +262,7 @@ def k3_fns(model, ids: list[int], B: int, dev, nb: int):
 
 def dsv4_core_fns(model, ids: list[int], B: int, dev):
     from minisgl.core import get_global_ctx
-    from minisgl.kernel.dsv4_triton import compressor_decode_step
-    from minisgl.models.deepseek_v4 import hadamard_matrix, layer_rope, linear_bf16_fp32
+    from minisgl.models.deepseek_v4 import layer_rope, linear_bf16_fp32
 
     ctx = get_global_ctx()
     backend = ctx.attn_backend
@@ -286,11 +285,7 @@ def dsv4_core_fns(model, ids: list[int], B: int, dev):
         pre.append((kvsc, ikvsc, iq, iw))
 
     def comp_step(c, kvsc, state_kv, state_sc, out_buf, row_base, cos, sin):
-        n = c._n_kv
-        pooled = compressor_decode_step(kvsc[:, :n], kvsc[:, n:], c.ape, pos, md.tok_table, state_kv, state_sc,
-                                        ratio=c.ratio, overlap=c.overlap, head_dim=c.head_dim)
-        had = hadamard_matrix(c.head_dim, str(dev)) if c.rotate else None
-        c._store(pooled, md.group_start[c.ratio], cos, sin, out_buf, md.comp_write[c.ratio], 2 if c.rotate else 1, had, row_base)
+        c.decode_step(kvsc, md, cos, sin, state_kv, state_sc, out_buf, row_base)
 
     def core(sparse_only: bool = False, indexer_only: bool = False):
         def fn():
@@ -394,6 +389,9 @@ def run_rank(rank: int, args) -> list[dict] | None:
             for t, lids in ids.items():
                 if args.core:
                     fns = (k3_core_fns if is_k3 else dsv4_core_fns)(model, lids, B, dev)
+                    if args.profile:
+                        profile_fn(fns[0], f"{args.model} core {t} B={B} C={args.ctx}")
+                        continue
                     n = len(lids)
                     rec = {}
                     for name, fn in zip(("core_us", "sparse_mla_us", "indexer_us"), fns):

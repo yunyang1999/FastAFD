@@ -9,6 +9,7 @@ Vendored from SGLang 0.5.18 (https://github.com/sgl-project/sglang), Apache Lice
   csrc/deepseek_v4/rope.cuh                  (unchanged)
   csrc/deepseek_v4/topk_v2.cuh               (unchanged; itself adapted from vLLM / FlashInfer)
   csrc/deepseek_v4/fp8_wo_a_group_major_quant.cuh (unchanged)
+  csrc/deepseek_v4/fused_norm_rope_v2.cuh    (unchanged)
 
 The Python loader (__init__.py) is a minimal reimplementation of sglang's
 ``load_jit`` wrapper generation (tvm-ffi exports, nvcc for the local GPU).

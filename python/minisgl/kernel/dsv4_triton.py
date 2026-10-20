@@ -670,7 +670,7 @@ def _compress_decode_kernel(
     tidx_ptr,  # [B] int32 state row
     skv_ptr,  # [R, ROWS, CD] fp32 state
     ssc_ptr,  # [R, ROWS, CD] fp32 state
-    pooled_ptr,  # [B, d] fp32 output (valid where complete)
+    pooled_ptr,  # [B, d] bf16 output (valid where complete)
     stride_in,  # row stride of kv / score (may be a slice of a wider GEMM output)
     CD,
     d,
@@ -679,6 +679,11 @@ def _compress_decode_kernel(
     ROWS: tl.constexpr,  # coff * ratio
     BLOCK: tl.constexpr,
 ):
+    """State rows: overlap (ratio 4) keeps the previous group in rows [0, RATIO)
+    (only their first half, the "overlap" projection, is read) and the current
+    group in rows [RATIO, 2 RATIO); otherwise rows [0, RATIO) hold the current
+    group. All state loads are issued together with this token's inputs (the
+    token's own row comes from registers), then pooling, then the stores."""
     b = tl.program_id(0)
     pid = tl.program_id(1)
     pos = tl.load(pos_ptr + b)
@@ -687,45 +692,64 @@ def _compress_decode_kernel(
     mask = offs < d
     rsel = pos % RATIO
     cur_row = rsel + (RATIO if OVERLAP else 0)
+    complete = ((pos + 1) % RATIO) == 0
     st_kv = skv_ptr + r * ROWS * CD
     st_sc = ssc_ptr + r * ROWS * CD
-    # write current token's projections (both halves when overlapping)
-    for half in tl.static_range(2 if OVERLAP else 1):
-        col = offs + half * d
-        kvv = tl.load(kv_ptr + b * stride_in + col, mask=mask, other=0.0)
-        scv = tl.load(score_ptr + b * stride_in + col, mask=mask, other=0.0) + tl.load(
-            ape_ptr + rsel * CD + col, mask=mask, other=0.0
+    rows = tl.arange(0, ROWS)
+    if OVERLAP:
+        # rows [0, ratio): first half of the previous group; rows [ratio, 2 ratio):
+        # second half of the current group
+        colsel = tl.where(rows[:, None] < RATIO, offs[None, :], offs[None, :] + d)
+    else:
+        colsel = offs[None, :] + rows[:, None] * 0
+    mp = mask[None, :] & (rows[:, None] != cur_row)
+    if OVERLAP:
+        # every 4th token completes: issue the state loads with the inputs
+        sc_st = tl.load(st_sc + rows[:, None] * CD + colsel, mask=mp & complete, other=float("-inf"))
+        kv_st = tl.load(st_kv + rows[:, None] * CD + colsel, mask=mp & complete, other=0.0)
+        # first half of the current group's rows: becomes the previous group
+        srows = tl.arange(0, RATIO)
+        msh = mask[None, :] & ((srows[:, None] + RATIO) != cur_row) & complete
+        kv_sh = tl.load(st_kv + (srows[:, None] + RATIO) * CD + offs[None, :], mask=msh, other=0.0)
+        sc_sh = tl.load(st_sc + (srows[:, None] + RATIO) * CD + offs[None, :], mask=msh, other=0.0)
+    kv0 = tl.load(kv_ptr + b * stride_in + offs, mask=mask, other=0.0)
+    sc0 = tl.load(score_ptr + b * stride_in + offs, mask=mask, other=0.0) + tl.load(
+        ape_ptr + rsel * CD + offs, mask=mask, other=0.0
+    )
+    if OVERLAP:
+        kv1 = tl.load(kv_ptr + b * stride_in + d + offs, mask=mask, other=0.0)
+        sc1 = tl.load(score_ptr + b * stride_in + d + offs, mask=mask, other=0.0) + tl.load(
+            ape_ptr + rsel * CD + d + offs, mask=mask, other=0.0
         )
-        tl.store(st_kv + cur_row * CD + col, kvv, mask=mask)
-        tl.store(st_sc + cur_row * CD + col, scv, mask=mask)
-    complete = ((pos + 1) % RATIO) == 0
+        kv_c = kv1
+        sc_c = sc1
+    else:
+        kv_c = kv0
+        sc_c = sc0
     if complete:
-        tl.debug_barrier()
-        rows = tl.arange(0, ROWS)
+        if not OVERLAP:
+            # ratio 128: rare completion, load the group only then
+            sc_st = tl.load(st_sc + rows[:, None] * CD + colsel, mask=mp, other=float("-inf"))
+            kv_st = tl.load(st_kv + rows[:, None] * CD + colsel, mask=mp, other=0.0)
+        is_cur = rows[:, None] == cur_row
+        sc_all = tl.where(is_cur, sc_c[None, :], sc_st)
+        kv_all = tl.where(is_cur, kv_c[None, :], kv_st)
+        mx = tl.max(sc_all, axis=0)
+        pw = tl.exp(sc_all - mx[None, :])
+        den = tl.sum(pw, axis=0)
+        pooled = tl.sum(pw * kv_all, axis=0) / den
+        tl.store(pooled_ptr + b * d + offs, pooled.to(pooled_ptr.dtype.element_ty), mask=mask)
         if OVERLAP:
-            # rows [0, ratio) use the first half of the previous group's rows,
-            # rows [ratio, 2*ratio) the second half of the current group's rows
-            colsel = tl.where(rows[:, None] < RATIO, offs[None, :], offs[None, :] + d)
-        else:
-            colsel = offs[None, :] + rows[:, None] * 0
-        m2 = mask[None, :] & (rows[:, None] >= 0)
-        sc = tl.load(st_sc + rows[:, None] * CD + colsel, mask=m2, other=float("-inf"))
-        kv = tl.load(st_kv + rows[:, None] * CD + colsel, mask=m2, other=0.0)
-        mx = tl.max(sc, axis=0)
-        p = tl.exp(sc - mx[None, :])
-        den = tl.sum(p, axis=0)
-        pooled = tl.sum(p * kv, axis=0) / den
-        tl.store(pooled_ptr + b * d + offs, pooled, mask=mask)
-        tl.debug_barrier()
-        if OVERLAP:
-            # shift: previous-group rows <- current-group rows (both halves)
-            for half in tl.static_range(2):
-                col = offs + half * d
-                for rr in tl.static_range(RATIO):
-                    v1 = tl.load(st_kv + (RATIO + rr) * CD + col, mask=mask, other=0.0)
-                    v2 = tl.load(st_sc + (RATIO + rr) * CD + col, mask=mask, other=0.0)
-                    tl.store(st_kv + rr * CD + col, v1, mask=mask)
-                    tl.store(st_sc + rr * CD + col, v2, mask=mask)
+            tl.debug_barrier()  # pooling loads of rows [0, ratio) precede the shift stores
+            is_cur_s = (srows[:, None] + RATIO) == cur_row
+            mst = mask[None, :] & (srows[:, None] >= 0)
+            tl.store(st_kv + srows[:, None] * CD + offs[None, :], tl.where(is_cur_s, kv0[None, :], kv_sh), mask=mst)
+            tl.store(st_sc + srows[:, None] * CD + offs[None, :], tl.where(is_cur_s, sc0[None, :], sc_sh), mask=mst)
+    tl.store(st_kv + cur_row * CD + offs, kv0, mask=mask)
+    tl.store(st_sc + cur_row * CD + offs, sc0, mask=mask)
+    if OVERLAP:
+        tl.store(st_kv + cur_row * CD + d + offs, kv1, mask=mask)
+        tl.store(st_sc + cur_row * CD + d + offs, sc1, mask=mask)
 
 
 def compressor_decode_step(
@@ -741,10 +765,11 @@ def compressor_decode_step(
     overlap: bool,
     head_dim: int,
 ) -> torch.Tensor:
-    """Returns pooled (pre-norm) compressed kv [B, d]; rows are meaningful only
-    for requests whose group completes at this position."""
+    """Returns pooled (pre-norm) compressed kv [B, d] bf16 (the reference rounds
+    the pooled value to bf16 before its norm); rows are meaningful only for
+    requests whose group completes at this position."""
     B, CD = kv.shape
-    pooled = torch.empty((B, head_dim), dtype=torch.float32, device=kv.device)
+    pooled = torch.empty((B, head_dim), dtype=torch.bfloat16, device=kv.device)
     if B == 0:
         return pooled
     rows = (2 if overlap else 1) * ratio

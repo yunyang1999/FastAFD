@@ -392,13 +392,93 @@ def test_sparse_perf(dev) -> None:
                 print(f"INFO sparse mla H={H} B={B} K={K}: native {t1:.1f} us, padded-128 {t2:.1f} us", flush=True)
 
 
+def test_index_store(dev) -> None:
+    """Decode-time indexer key store: sglang's fused_norm_rope_v2 indexer kernel vs
+    the Triton store (same cache layout); only completing groups are written."""
+    from minisgl.kernel.dsv4_sgl import freqs_real, gather_index_keys, store_index_keys, store_index_keys_decode
+    from minisgl.models.deepseek_v4 import hadamard_matrix
+
+    g = torch.Generator(device=dev).manual_seed(17)
+    D, R, P = 128, 64, 4096
+    ang = torch.rand(P, R // 2, generator=g, device=dev) * 6.28
+    cos, sin = ang.cos(), ang.sin()
+    had = hadamard_matrix(D, str(dev))
+    for B in (8, 128):
+        pos = torch.randint(0, P - 1, (B,), generator=g, device=dev, dtype=torch.int32)
+        complete = ((pos + 1) % 4) == 0
+        rows = torch.where(complete, torch.randperm(4 * B, generator=g, device=dev)[:B], -1).long()
+        keys = torch.randn(B, D, generator=g, device=dev).to(torch.bfloat16)
+        normw = (1 + 0.1 * torch.randn(D, generator=g, device=dev)).to(torch.bfloat16)
+        plan = torch.zeros(B, 4, dtype=torch.int32, device=dev)
+        plan[:, 0] = pos + 1
+        npg = (4 * B + 63) // 64 + 1
+        c_ref = torch.zeros(npg, 64 * 132, dtype=torch.uint8, device=dev)
+        c_new = torch.zeros_like(c_ref)
+        store_index_keys(keys, normw, (pos + 1 - 4).clamp(min=0), cos, sin, had, c_ref, rows, eps=1e-6, rope_dim=R)
+        store_index_keys_decode(keys, plan.view(torch.uint8), normw, 1e-6, freqs_real(cos, sin), rows, c_new)
+        sel = rows[rows >= 0]
+        # both quantise to FP8 per token; intermediate bf16 rounding differs, so a
+        # few elements land one FP8 step apart: compare in L2
+        kn, kr = gather_index_keys(c_new, sel).float(), gather_index_keys(c_ref, sel).float()
+        rel = ((kn - kr).norm() / kr.norm()).item()
+        ok = rel < 2e-2
+        print(f"{'PASS' if ok else 'FAIL'} index store sglang vs triton B={B}: rel_l2={rel:.3e} (tol 2e-2)", flush=True)
+        if not ok:
+            FAILS.append(f"index store B={B}")
+        written = (c_new[:, : 64 * 128].reshape(npg * 64, 128) != 0).any(dim=1)
+        expect = torch.zeros_like(written)
+        expect[sel] = True
+        if (written & ~expect).any().item():
+            print(f"FAIL index store B={B}: entries of non-completing requests written", flush=True)
+            FAILS.append(f"index store extra writes B={B}")
+
+
+def test_sparse_fp8(dev) -> None:
+    """trtllm-gen sparse MLA with FP8 (e4m3, scale 1) query + KV rows vs the BF16
+    kernel on the same FP8-representable KV (the difference is the q cast)."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    g = torch.Generator(device=dev).manual_seed(23)
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    rows = 1 << 18
+    kv8 = (torch.randn(rows, 576, generator=g, device=dev) * 0.5).to(torch.float8_e4m3fn)
+    kv8[:, 512:] = 0
+    kv16 = kv8.to(torch.bfloat16)
+    for H in (64, 128):
+        for B, K in ((8, 128), (32, 640), (128, 640)):
+            idx = torch.randint(0, rows, (B, 1, K), generator=g, device=dev, dtype=torch.int32)
+            sl = torch.full((B,), K, dtype=torch.int32, device=dev)
+            q = (torch.randn(B, 1, H, 576, generator=g, device=dev)).to(torch.bfloat16)
+            q[..., 512:] = 0
+            sinks = torch.randn(H, generator=g, device=dev) * 0.1
+
+            def run(qq, kv):
+                return trtllm_batch_decode_with_kv_cache_mla(
+                    query=qq, kv_cache=kv.view(-1, 1, 64, 576), workspace_buffer=ws, qk_nope_head_dim=128,
+                    kv_lora_rank=512, qk_rope_head_dim=64, block_tables=idx, seq_lens=sl, max_seq_len=rows,
+                    sparse_mla_top_k=K, bmm1_scale=512**-0.5, bmm2_scale=1.0, sinks=sinks, backend="trtllm-gen")
+
+            o16 = run(q, kv16).view(B, H, 512)
+            o8 = run(q.to(torch.float8_e4m3fn), kv8).view(B, H, 512)
+            rel = ((o8.float() - o16.float()).norm() / o16.float().norm()).item()
+            ok = rel < 5e-2 and torch.isfinite(o8.float()).all().item()
+            print(f"{'PASS' if ok else 'FAIL'} sparse fp8 H={H} B={B} K={K}: rel_l2 vs bf16 {rel:.3e} (tol 5e-2)", flush=True)
+            if not ok:
+                FAILS.append(f"sparse fp8 H={H} B={B} K={K}")
+            t16 = _time(lambda: run(q, kv16))
+            q8 = q.to(torch.float8_e4m3fn)
+            t8 = _time(lambda: run(q8, kv8))
+            print(f"INFO sparse mla H={H} B={B} K={K}: bf16 {t16:.1f} us, fp8 {t8:.1f} us", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="kda,router,mhc,mla,attn_res,dsv4_elem,indexer,wo_a,mla_perf")
+    ap.add_argument("--only", default="kda,router,mhc,mla,attn_res,dsv4_elem,indexer,index_store,sparse_fp8,wo_a,mla_perf")
     args = ap.parse_args()
     dev = torch.device("cuda")
     only = set(args.only.split(","))
-    for name, fn in (("attn_res", test_attn_res), ("dsv4_elem", test_dsv4_elem), ("indexer", test_indexer), ("wo_a", test_wo_a),
+    for name, fn in (("attn_res", test_attn_res), ("dsv4_elem", test_dsv4_elem), ("indexer", test_indexer),
+                     ("index_store", test_index_store), ("sparse_fp8", test_sparse_fp8), ("wo_a", test_wo_a),
                      ("sparse_perf", test_sparse_perf), ("mla_perf", test_mla_perf)):
         if name in only:
             try:

@@ -3,7 +3,9 @@
 The backend owns per-batch index metadata; the layers (models/deepseek_v4.py)
 compute projections, write caches and call :meth:`DSV4AttnBackend.sparse_attn`,
 which runs flashinfer's trtllm-gen sparse MLA decode kernel over explicit per-token
-row lists (window rows + compressed rows) with per-head attention sinks.
+row lists (window rows + compressed rows) with per-head attention sinks. With the
+default FP8 KV rows (``MINISGL_DSV4_KV_DTYPE=fp8``) the query is cast to FP8 too and
+the e4m3 kernels run (per-tensor scales of 1).
 """
 
 from __future__ import annotations
@@ -28,14 +30,16 @@ def _pad_to(x: int, a: int) -> int:
 
 
 @triton.jit
-def _pad_q_kernel(q_ptr, out_ptr, H, Hp, stride_t, stride_h, D: tl.constexpr, DP: tl.constexpr, BLOCK: tl.constexpr):
-    """out [T, Hp, DP] = q [T, H, D] zero-padded in heads and features (one pass)."""
-    r = tl.program_id(0)
-    t = r // Hp
-    h = r - t * Hp
-    j = tl.arange(0, BLOCK)
-    v = tl.load(q_ptr + t * stride_t + h * stride_h + j, mask=(j < D) & (h < H), other=0.0)
-    tl.store(out_ptr + r * DP + j, v, mask=j < DP)
+def _mla_query_kernel(q_ptr, out_ptr, H, stride_t, stride_h, stride_out, D: tl.constexpr, DP: tl.constexpr,
+                      HB: tl.constexpr):
+    """out[t, h, :D] = q[t, h, :D] cast to the query dtype for h < H. The padded
+    heads and the features D..DP of ``out`` are zero and are not touched."""
+    t = tl.program_id(0)
+    h = tl.program_id(1) * HB + tl.arange(0, HB)
+    j = tl.arange(0, D)
+    m = (h < H)[:, None]
+    v = tl.load(q_ptr + t * stride_t + h[:, None] * stride_h + j[None, :], mask=m, other=0.0)
+    tl.store(out_ptr + t * stride_out + h[:, None] * DP + j[None, :], v.to(out_ptr.dtype.element_ty), mask=m)
 
 
 @triton.jit
@@ -106,6 +110,8 @@ class DSV4Metadata(BaseAttnMetadata):
     c4_bt: torch.Tensor | None = None  # [T, NP] int32 page ids (64 c4 entries per page)
     dg_sched: torch.Tensor | None = None  # [num_sms + 1, 2] int32
     topk_plan: torch.Tensor | None = None  # [T + 1, 2] int32
+    # compressor decode plan (sglang DecodePlan, 16 B per token; only seq_len = pos + 1 is set)
+    plan_d: torch.Tensor | None = None  # [T, 16] uint8
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -132,6 +138,12 @@ class DSV4AttnBackend(BaseAttnBackend):
         self.capture_bs: List[int] = []
         self._capture_meta: Dict[int, DSV4Metadata] = {}
         self._sinks_pad: Dict[tuple, torch.Tensor] = {}
+        # zero-initialised [T, 1, Hp, 576] query buffers reused by graph replays;
+        # only the real heads' first 512 features are rewritten per call
+        self._qbuf: Dict[tuple, torch.Tensor] = {}
+        from minisgl.distributed import get_tp_info
+
+        self.n_local = int(d["num_attention_heads"]) // get_tp_info().size
         import os
 
         self.indexer_impl = os.environ.get("MINISGL_DSV4_INDEXER", "sglang").lower()
@@ -231,6 +243,11 @@ class DSV4AttnBackend(BaseAttnBackend):
             comp_write[r] = torch.where(complete, (slot // r).long(), -1)
             group_start[r] = (pos + 1 - r).clamp(min=0).to(torch.int32)
         seq_lens = (pos + 1).to(torch.int32)
+        plan_d = None
+        if is_decode and any(r == 4 for r in self.ratios):
+            plan_d = torch.zeros((T, 4), dtype=torch.int32, device=dev)
+            plan_d[:, 0] = seq_lens
+            plan_d = plan_d.view(torch.uint8)
         prefill_seqs: List[DSV4PrefillSeq] = []
         if not is_decode:
             for i, req in enumerate(reqs):
@@ -259,6 +276,7 @@ class DSV4AttnBackend(BaseAttnBackend):
             c4_bt=c4_bt,
             dg_sched=dg_sched,
             topk_plan=topk_plan,
+            plan_d=plan_d,
         )
         return md
 
@@ -271,12 +289,23 @@ class DSV4AttnBackend(BaseAttnBackend):
     _GRAPH_FIELDS = (
         "tok_table", "tok_cached", "scratch_rows", "window_idx", "ring_src", "ring_dst",
         "c128_idx", "c4_rows", "n4_valid", "n128_valid", "n_window", "seq_lens", "cu_seqlens_q",
-        "c4_bt", "dg_sched", "topk_plan",
+        "c4_bt", "dg_sched", "topk_plan", "plan_d",
     )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.capture_bs = sorted(bs_list)
         self._capture_meta = {}
+        rows = max(bs_list) if bs_list else 0
+        for hp in sorted({self.n_local, 128 if self.n_local < 128 else self.n_local}):
+            key = (hp, self.pool.kv_dtype)
+            if rows and (key not in self._qbuf or self._qbuf[key].shape[0] < rows):
+                self._qbuf[key] = torch.zeros((rows, 1, hp, 576), dtype=self.pool.kv_dtype, device=self.device)
+
+    def _query_buffer(self, T: int, Hp: int, dtype: torch.dtype) -> torch.Tensor:
+        buf = self._qbuf.get((Hp, dtype))
+        if buf is not None and buf.shape[0] >= T:
+            return buf[:T]
+        return torch.zeros((T, 1, Hp, 576), dtype=dtype, device=self.device)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         bs = batch.size
@@ -342,7 +371,8 @@ class DSV4AttnBackend(BaseAttnBackend):
         scale: float,
         seq_lens: torch.Tensor,
     ) -> torch.Tensor:
-        """q [T, H, 512] bf16; idx [T, K] int32 rows of ``layer_kv`` (-1 invalid)."""
+        """q [T, H, 512] bf16; idx [T, K] int32 rows of ``layer_kv`` (-1 invalid).
+        FP8 ``layer_kv`` runs the e4m3 kernel with an FP8 query (scales 1)."""
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
         T, H, D = q.shape
@@ -355,9 +385,11 @@ class DSV4AttnBackend(BaseAttnBackend):
         # heads; zero-padding the query heads to 128 selects the 2-CTA
         # high-throughput kernel, which wins once the batch x top-k is large
         Hp = 128 if (H < 128 and T * Kp >= (16384 if H >= 64 else 65536)) else H
-        q576 = torch.empty((T, 1, Hp, 576), dtype=q.dtype, device=q.device)
+        q576 = self._query_buffer(T, Hp, layer_kv.dtype)
         if T:
-            _pad_q_kernel[(T * Hp,)](q, q576, H, Hp, q.stride(0), q.stride(1), D=D, DP=576, BLOCK=1024, num_warps=4)
+            _mla_query_kernel[(T, triton.cdiv(H, 8))](
+                q, q576, H, q.stride(0), q.stride(1), Hp * 576, D=D, DP=576, HB=8, num_warps=4,
+            )
         if Hp != H:
             key = (sinks.data_ptr(), Hp)
             sp = self._sinks_pad.get(key)

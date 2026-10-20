@@ -235,16 +235,19 @@ def test_compressor_decode():
             )
             pr, comp = ref_compress_decode(kv, sc, ape, pos, ref_kv, ref_sc, ratio, overlap, d)
             if comp.any():
-                e = (pooled[comp] - pr[comp]).abs().max().item()
-                if e > 1e-4:
+                # pooled is stored as bf16 (the reference rounds it before its norm)
+                e = ((pooled[comp].float() - pr[comp]).abs() / (pr[comp].abs() + 1e-3)).max().item()
+                if e > 1e-2:
                     ok_all = False
                     print(f"   step {step} pooled err {e}")
-        report(
-            f"compressor_decode r{ratio} ov{int(overlap)} d{d} state",
-            st_kv[tidx.long()],
-            ref_kv,
-            1e-5,
-        )
+        # with overlap only the first half of the previous-group rows is ever read
+        got = st_kv[tidx.long()]
+        if overlap:
+            got, ref_cmp = torch.cat([got[:, :ratio, :d].flatten(1), got[:, ratio:].flatten(1)], 1), torch.cat(
+                [ref_kv[:, :ratio, :d].flatten(1), ref_kv[:, ratio:].flatten(1)], 1)
+        else:
+            ref_cmp = ref_kv
+        report(f"compressor_decode r{ratio} ov{int(overlap)} d{d} state", got, ref_cmp, 1e-5)
         RESULTS.append((f"compressor_decode r{ratio} pooled", 0.0, 0.0, ok_all))
         print(f"{'PASS' if ok_all else 'FAIL'} compressor_decode r{ratio} pooled")
 

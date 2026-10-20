@@ -132,6 +132,7 @@ class DSV4Args:
 # "sglang": vendored sglang 0.5.18 decode kernels; "legacy": the reference-style kernels
 _ROUTER_IMPL = os.environ.get("MINISGL_DSV4_ROUTER", "sglang").lower()
 _ATTN_ELEMWISE_IMPL = os.environ.get("MINISGL_DSV4_ATTN_ELEMWISE", "sglang").lower()
+_INDEX_STORE_IMPL = os.environ.get("MINISGL_DSV4_INDEX_STORE", "sglang").lower()  # sglang | triton
 _WO_A_FP8 = os.environ.get("MINISGL_DSV4_WO_A", "fp8").lower() == "fp8"
 
 
@@ -250,6 +251,7 @@ class DSV4Compressor(BaseOP):
         self._rope_dim = args.rope_dim
         self._w_kv_gate: torch.Tensor | None = None
         self._n_kv = coff * head_dim
+        self._norm_w_bf16: torch.Tensor | None = None
 
     def merge_weights(self) -> None:
         """wkv|wgate as one BF16 weight (sglang ``wkv_gate``); the modules keep views."""
@@ -287,11 +289,7 @@ class DSV4Compressor(BaseOP):
         kv, sc = kvsc[:, : self._n_kv], kvsc[:, self._n_kv :]
         pos = get_global_ctx().batch.positions
         if md.is_decode:
-            pooled = compressor_decode_step(
-                kv, sc, self.ape, pos, md.tok_table, state_kv, state_sc,
-                ratio=ratio, overlap=self.overlap, head_dim=d,
-            )
-            self._store(pooled, md.group_start[ratio], cos, sin, out_buf, md.comp_write[ratio], quant, had, row_base)
+            self.decode_step(kvsc, md, cos, sin, state_kv, state_sc, out_buf, row_base)
             return
         pooled_all, rows_all, gpos_all = [], [], []
         page_table = get_global_ctx().page_table
@@ -310,10 +308,37 @@ class DSV4Compressor(BaseOP):
                 quant, had,
             )
 
+    def decode_step(self, kvsc, md, cos, sin, state_kv, state_sc, out_buf, row_base: int) -> None:
+        """One decode token per request: state update + pooling of completed
+        groups (Triton), then norm + RoPE (+ quant) into the cache rows. Indexer
+        keys use sglang's fused_norm_rope_v2 indexer kernel."""
+        from minisgl.kernel.dsv4_triton import compressor_decode_step
+
+        ratio, d = self.ratio, self.head_dim
+        pos = get_global_ctx().batch.positions
+        n = self._n_kv
+        pooled = compressor_decode_step(
+            kvsc[:, :n], kvsc[:, n:], self.ape, pos, md.tok_table, state_kv, state_sc,
+            ratio=ratio, overlap=self.overlap, head_dim=d,
+        )
+        if out_buf.dtype == torch.uint8 and md.plan_d is not None and _INDEX_STORE_IMPL == "sglang":
+            from minisgl.kernel.dsv4_sgl import freqs_real, store_index_keys_decode
+
+            w = self.norm.weight
+            if w.dtype != torch.bfloat16:
+                if self._norm_w_bf16 is None:
+                    self._norm_w_bf16 = w.to(torch.bfloat16)
+                w = self._norm_w_bf16
+            store_index_keys_decode(pooled, md.plan_d, w, self._eps, freqs_real(cos, sin), md.comp_write[ratio], out_buf, ratio)
+            return
+        quant = 2 if self.rotate else 1
+        had = hadamard_matrix(d, str(kvsc.device)) if self.rotate else None
+        self._store(pooled, md.group_start[ratio], cos, sin, out_buf, md.comp_write[ratio], quant, had, row_base)
+
     def _store(self, pooled, gpos, cos, sin, out_buf, rows, quant, had, row_base: int = 0) -> None:
         """Completed compressed entries -> cache rows. The indexer cache (uint8)
         holds paged FP8 keys + FP32 scales (sglang's DeepGEMM layout); attention
-        rows are BF16 576-wide."""
+        rows are 576 wide (FP8 or BF16, see ``MINISGL_DSV4_KV_DTYPE``)."""
         if out_buf.dtype == torch.uint8:
             from minisgl.kernel.dsv4_sgl import store_index_keys
 
@@ -597,7 +622,8 @@ class DSV4Attention(BaseOP):
         o = backend.sparse_attn(q, layer_kv, idx, self.attn_sink, self.head_dim**-0.5, seq_lens)
         # persist this forward's window kv into the per-request ring
         if md.ring_src.numel():
-            layer_kv.index_copy_(0, md.ring_dst, layer_kv.index_select(0, md.ring_src))
+            kvb = layer_kv.view(torch.uint8)  # byte rows: index ops do not take FP8
+            kvb.index_copy_(0, md.ring_dst, kvb.index_select(0, md.ring_src))
         if use_sgl:
             from minisgl.kernel.dsv4_sgl import freqs_real, fused_rope_inplace
 
