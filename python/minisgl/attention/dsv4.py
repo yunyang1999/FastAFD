@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+import triton
+import triton.language as tl
 from minisgl.core import Batch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -23,6 +25,41 @@ if TYPE_CHECKING:
 
 def _pad_to(x: int, a: int) -> int:
     return (x + a - 1) // a * a
+
+
+@triton.jit
+def _assemble_index_kernel(
+    win_ptr,  # [T, W] int32 window rows (valid prefix of n_window)
+    nwin_ptr,  # [T] int32
+    comp_ptr,  # [T, Kc] compressed rows (valid prefix)
+    ccnt_ptr,  # [T] valid compressed count (clamped to Kc)
+    out_ptr,  # [T, Kp] int32
+    sl_ptr,  # [T] int32 total valid
+    W,
+    Kc,
+    Kp,
+    stride_w,
+    stride_c,
+    comp_off,
+    HAS_COMP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    nw = tl.load(nwin_ptr + t)
+    nc = 0
+    if HAS_COMP:
+        nc = tl.minimum(tl.load(ccnt_ptr + t).to(tl.int32), Kc)
+    for j0 in range(0, Kp, BLOCK):
+        j = j0 + tl.arange(0, BLOCK)
+        wv = tl.load(win_ptr + t * stride_w + j, mask=(j < nw) & (j < W), other=-1)
+        v = tl.where(j < nw, wv, -1)
+        if HAS_COMP:
+            cj = j - nw
+            inc = (cj >= 0) & (cj < nc)
+            cv = tl.load(comp_ptr + t * stride_c + tl.where(inc, cj, 0), mask=inc, other=-1).to(tl.int32)
+            v = tl.where(inc, cv + comp_off, v)
+        tl.store(out_ptr + t * Kp + j, v, mask=j < Kp)
+    tl.store(sl_ptr + t, nw + nc)
 
 
 @dataclass
@@ -83,6 +120,7 @@ class DSV4AttnBackend(BaseAttnBackend):
         self.capture: Dict[str, torch.Tensor] | None = None
         self.capture_bs: List[int] = []
         self._capture_meta: Dict[int, DSV4Metadata] = {}
+        self._sinks_pad: Dict[tuple, torch.Tensor] = {}
         import os
 
         self.indexer_impl = os.environ.get("MINISGL_DSV4_INDEXER", "sglang").lower()
@@ -263,20 +301,26 @@ class DSV4AttnBackend(BaseAttnBackend):
 
     @staticmethod
     def attn_index(
-        md: DSV4Metadata, comp: torch.Tensor | None, comp_count: torch.Tensor | None
+        md: DSV4Metadata, comp: torch.Tensor | None, comp_count: torch.Tensor | None, comp_off: int = 0
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """[window | compressed] row lists compacted so the valid entries form a
-        prefix (the sparse kernel does not skip -1 holes), plus valid counts."""
+        prefix (the sparse kernel does not skip -1 holes), padded with -1 to a
+        multiple of 64 columns, plus valid counts. ``comp`` holds a valid prefix
+        of ``comp_count`` (clamped to its width) entries; ``comp_off`` is added
+        to valid compressed rows. One Triton kernel."""
         win = md.window_idx
-        if comp is None:
-            return win, md.n_window
         T, W = win.shape
-        Kc = comp.shape[1]
-        out = win.new_full((T, W + Kc), -1)
-        out[:, :W] = win
-        cols = md.n_window.long()[:, None] + torch.arange(Kc, device=win.device)[None, :]
-        out.scatter_(1, cols, comp.to(out.dtype))
-        return out, md.n_window + comp_count.to(torch.int32)
+        Kc = 0 if comp is None else comp.shape[1]
+        Kp = _pad_to(W + Kc, 64)
+        out = torch.empty((T, Kp), dtype=torch.int32, device=win.device)
+        seq_lens = torch.empty((T,), dtype=torch.int32, device=win.device)
+        if T:
+            _assemble_index_kernel[(T,)](
+                win, md.n_window, comp if comp is not None else win, comp_count if comp is not None else md.n_window,
+                out, seq_lens, W, Kc, Kp, win.stride(0), comp.stride(0) if comp is not None else 0, int(comp_off),
+                HAS_COMP=comp is not None, BLOCK=min(1024, triton.next_power_of_2(Kp)), num_warps=4,
+            )
+        return out, seq_lens
 
     def sparse_attn(
         self,
@@ -295,7 +339,21 @@ class DSV4AttnBackend(BaseAttnBackend):
         Kp = _pad_to(K, 64)
         if Kp != K:
             idx = torch.cat([idx, idx.new_full((T, Kp - K), -1)], dim=1)
-        q576 = torch.nn.functional.pad(q, (0, 576 - D)).view(T, 1, H, 576)
+        idx = idx.to(torch.int32)
+        # flashinfer picks the low-latency (16-head tile) sparse kernel below 128
+        # heads; zero-padding the query heads to 128 selects the 2-CTA
+        # high-throughput kernel, which wins once the batch x top-k is large
+        Hp = 128 if (H < 128 and T * Kp >= (16384 if H >= 64 else 65536)) else H
+        q576 = torch.zeros((T, 1, Hp, 576), dtype=q.dtype, device=q.device)
+        q576[:, 0, :H, :D] = q
+        if Hp != H:
+            key = (sinks.data_ptr(), Hp)
+            sp = self._sinks_pad.get(key)
+            if sp is None:
+                sp = torch.zeros(Hp, dtype=sinks.dtype, device=sinks.device)
+                sp[:H] = sinks
+                self._sinks_pad[key] = sp
+            sinks = sp
         out = trtllm_batch_decode_with_kv_cache_mla(
             query=q576,
             kv_cache=layer_kv.view(-1, 1, 64, 576),
@@ -312,7 +370,7 @@ class DSV4AttnBackend(BaseAttnBackend):
             sinks=sinks,
             backend="trtllm-gen",
         )
-        return out.view(T, H, 512)
+        return out.view(T, Hp, 512)[:, :H]
 
 
 __all__ = ["DSV4AttnBackend", "DSV4Metadata", "DSV4PrefillSeq"]

@@ -271,6 +271,137 @@ import os as _os
 _HC_GEMM_BACKEND = _os.environ.get("MINISGL_DSV4_HC_GEMM", "deepgemm").lower()
 
 
+@triton.jit
+def _hc_pre_split_kernel(
+    d_ptr,  # [S, T, MIX] fp32 split-K partial products (x_flat @ hc_fn^T)
+    sq_ptr,  # [S, T] fp32 split-K partial sums of squares of x_flat
+    x_ptr,  # [T, HC, D] bf16
+    scale_ptr,  # [3] fp32
+    base_ptr,  # [MIX] fp32
+    nw_ptr,  # [D] norm weight (HAS_NORM)
+    y_ptr,  # [T, D] bf16
+    post_ptr,  # [T, HC] fp32
+    comb_ptr,  # [T, HC, HC] fp32
+    T,
+    S,
+    D,
+    inv_k,
+    rms_eps,
+    eps,
+    norm_eps,
+    ITERS: tl.constexpr,
+    HC: tl.constexpr,
+    MIX: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_NORM: tl.constexpr,
+):
+    """mHC pre (one program per token): split-K reduction of the prenorm GEMM,
+    rsqrt normalisation, Sinkhorn mixing weights, pre-weighted sum of the HC
+    residual copies and (optionally) the following RMSNorm -- the fused shape of
+    sglang's mhc_pre_big_fuse_with_norm."""
+    t = tl.program_id(0)
+    hc = tl.arange(0, HC)
+    cc = tl.arange(0, HC * HC)
+    acc_pre = tl.zeros([HC], dtype=tl.float32)
+    acc_post = tl.zeros([HC], dtype=tl.float32)
+    acc_comb = tl.zeros([HC * HC], dtype=tl.float32)
+    sqv = tl.zeros([BLOCK_S], dtype=tl.float32)
+    for s0 in range(0, S, BLOCK_S):
+        sv = s0 + tl.arange(0, BLOCK_S)
+        ms = sv < S
+        base = d_ptr + (sv[:, None] * T + t) * MIX
+        acc_pre += tl.sum(tl.load(base + hc[None, :], mask=ms[:, None], other=0.0), axis=0)
+        acc_post += tl.sum(tl.load(base + HC + hc[None, :], mask=ms[:, None], other=0.0), axis=0)
+        acc_comb += tl.sum(tl.load(base + 2 * HC + cc[None, :], mask=ms[:, None], other=0.0), axis=0)
+        sqv += tl.load(sq_ptr + sv * T + t, mask=ms, other=0.0)
+    r = 1.0 / tl.sqrt(tl.sum(sqv, axis=0) * inv_k + rms_eps)
+    s0_ = tl.load(scale_ptr + 0)
+    s1_ = tl.load(scale_ptr + 1)
+    s2_ = tl.load(scale_ptr + 2)
+    pre = tl.sigmoid(acc_pre * r * s0_ + tl.load(base_ptr + hc)) + eps
+    post = 2.0 * tl.sigmoid(acc_post * r * s1_ + tl.load(base_ptr + HC + hc))
+    tl.store(post_ptr + t * HC + hc, post)
+    c = tl.reshape(acc_comb * r * s2_ + tl.load(base_ptr + 2 * HC + cc), (HC, HC))
+    rmax = tl.max(c, axis=1)
+    c = tl.exp(c - rmax[:, None])
+    rsum = tl.sum(c, axis=1)
+    c = c / rsum[:, None] + eps
+    csum = tl.sum(c, axis=0)
+    c = c / (csum[None, :] + eps)
+    for _ in range(ITERS - 1):
+        rsum = tl.sum(c, axis=1)
+        c = c / (rsum[:, None] + eps)
+        csum = tl.sum(c, axis=0)
+        c = c / (csum[None, :] + eps)
+    jj = tl.arange(0, HC)[:, None]
+    kk = tl.arange(0, HC)[None, :]
+    tl.store(comb_ptr + t * HC * HC + jj * HC + kk, c)
+    # pre-weighted sum of the residual copies (+ RMSNorm over the full row)
+    ss = 0.0
+    for d0 in range(0, D, BLOCK_D):
+        offs = d0 + tl.arange(0, BLOCK_D)
+        mask = offs < D
+        xv = tl.load(x_ptr + t * HC * D + hc[:, None] * D + offs[None, :], mask=mask[None, :], other=0.0).to(tl.float32)
+        y = tl.sum(pre[:, None] * xv, axis=0)
+        yb = y.to(y_ptr.dtype.element_ty)
+        tl.store(y_ptr + t * D + offs, yb, mask=mask)
+        yf = yb.to(tl.float32)
+        ss += tl.sum(tl.where(mask, yf * yf, 0.0), axis=0)
+    if HAS_NORM:
+        rn = 1.0 / tl.sqrt(ss / D + norm_eps)
+        for d0 in range(0, D, BLOCK_D):
+            offs = d0 + tl.arange(0, BLOCK_D)
+            mask = offs < D
+            yv = tl.load(y_ptr + t * D + offs, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(nw_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            tl.store(y_ptr + t * D + offs, (yv * rn * w).to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def hc_pre_split(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    rms_eps: float,
+    sinkhorn_iters: int,
+    eps: float,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mHC pre on DeepGEMM's TF32 split-K prenorm GEMM + one fused Triton kernel
+    (split reduction, Sinkhorn, weighted sum, optional RMSNorm).
+    x [T, HC, D] bf16 -> (y [T, D], post [T, HC], comb [T, HC, HC])."""
+    from minisgl.kernel import deepgemm as dg
+
+    T, HC, D = x.shape
+    MIX = (2 + HC) * HC
+    K = HC * D
+    S = _hc_prenorm_splits(T, K)
+    x = x.contiguous()
+    d = torch.empty((S, T, MIX), dtype=torch.float32, device=x.device)
+    sq = torch.empty((S, T), dtype=torch.float32, device=x.device)
+    y = torch.empty((T, D), dtype=x.dtype, device=x.device)
+    post = torch.empty((T, HC), dtype=torch.float32, device=x.device)
+    comb = torch.empty((T, HC, HC), dtype=torch.float32, device=x.device)
+    if T == 0:
+        return y, post, comb
+    dg.tf32_hc_prenorm_gemm(x.view(T, K), hc_fn, d, sq, S)
+    _hc_pre_split_kernel[(T,)](
+        d, sq, x, hc_scale.contiguous(), hc_base.contiguous(),
+        norm_weight if norm_weight is not None else hc_scale, y, post, comb,
+        T, S, D, 1.0 / K, float(rms_eps), float(eps), float(norm_eps),
+        ITERS=int(sinkhorn_iters), HC=HC, MIX=MIX, BLOCK_S=min(64, triton.next_power_of_2(S)), BLOCK_D=1024,
+        HAS_NORM=norm_weight is not None, num_warps=4,
+    )
+    return y, post, comb
+
+
+def hc_pre_split_supported(x: torch.Tensor, hc_fn: torch.Tensor) -> bool:
+    return _HC_GEMM_BACKEND != "torch" and x.dtype == torch.bfloat16 and hc_fn.shape[0] >= 16 and x.shape[0] > 0
+
+
 # ---------------------------------------------------------------------------
 # quant-dequant simulation helpers (device functions)
 # ---------------------------------------------------------------------------
@@ -403,9 +534,10 @@ def _kv_norm_rope_store_kernel(
     cos_ptr,
     sin_ptr,
     out_ptr,  # [N, ROW] bf16 cache
-    slot_ptr,  # [T] int64 destination row (negative -> skip)
+    slot_ptr,  # [T] int64 destination row (negative -> skip), offset by row_base
     stride_kv,
     ROW,
+    row_base,
     eps,
     D: tl.constexpr,
     ROPE: tl.constexpr,
@@ -416,6 +548,7 @@ def _kv_norm_rope_store_kernel(
     slot = tl.load(slot_ptr + t).to(tl.int64)
     if slot < 0:
         return
+    slot = slot + row_base
     NOPE: tl.constexpr = D - ROPE
     HALF: tl.constexpr = ROPE // 2
     offs = tl.arange(0, D)
@@ -467,15 +600,19 @@ def kv_norm_rope_store(
     rope_dim: int,
     quant: int,
     hadamard: torch.Tensor | None = None,
+    row_base: int = 0,
 ) -> None:
-    """Normalise+RoPE(+quant-sim) rows of ``kv`` [T, D] into ``out[slots, :D]``."""
+    """Normalise+RoPE(+quant-sim) rows of ``kv`` [T, D] into ``out[row_base + slots, :D]``
+    (negative slots skipped)."""
     T, D = kv.shape
     if T == 0:
         return
     assert kv.stride(-1) == 1 and out.stride(-1) == 1
+    if slots.dtype != torch.int64:
+        slots = slots.to(torch.int64)
     _kv_norm_rope_store_kernel[(T,)](
-        kv, norm_weight, positions, cos, sin, out, slots.to(torch.int64), kv.stride(0),
-        out.stride(0), float(eps), D=D, ROPE=rope_dim, QUANT=int(quant),
+        kv, norm_weight, positions, cos, sin, out, slots, kv.stride(0),
+        out.stride(0), int(row_base), float(eps), D=D, ROPE=rope_dim, QUANT=int(quant),
         had_ptr=hadamard if hadamard is not None else cos,
         num_warps=4 if D <= 128 else 8,
     )
@@ -534,6 +671,7 @@ def _compress_decode_kernel(
     skv_ptr,  # [R, ROWS, CD] fp32 state
     ssc_ptr,  # [R, ROWS, CD] fp32 state
     pooled_ptr,  # [B, d] fp32 output (valid where complete)
+    stride_in,  # row stride of kv / score (may be a slice of a wider GEMM output)
     CD,
     d,
     RATIO: tl.constexpr,
@@ -554,8 +692,8 @@ def _compress_decode_kernel(
     # write current token's projections (both halves when overlapping)
     for half in tl.static_range(2 if OVERLAP else 1):
         col = offs + half * d
-        kvv = tl.load(kv_ptr + b * CD + col, mask=mask, other=0.0)
-        scv = tl.load(score_ptr + b * CD + col, mask=mask, other=0.0) + tl.load(
+        kvv = tl.load(kv_ptr + b * stride_in + col, mask=mask, other=0.0)
+        scv = tl.load(score_ptr + b * stride_in + col, mask=mask, other=0.0) + tl.load(
             ape_ptr + rsel * CD + col, mask=mask, other=0.0
         )
         tl.store(st_kv + cur_row * CD + col, kvv, mask=mask)
@@ -612,9 +750,11 @@ def compressor_decode_step(
     rows = (2 if overlap else 1) * ratio
     BLOCK = 128 if rows <= 16 else 32
     grid = (B, triton.cdiv(head_dim, BLOCK))
+    if kv.stride(-1) != 1 or score.stride(-1) != 1 or kv.stride(0) != score.stride(0):
+        kv, score = kv.contiguous(), score.contiguous()
     _compress_decode_kernel[grid](
-        kv.contiguous(), score.contiguous(), ape.contiguous(), positions, table_idx,
-        state_kv, state_score, pooled, CD, head_dim,
+        kv, score, ape.contiguous(), positions, table_idx,
+        state_kv, state_score, pooled, kv.stride(0), CD, head_dim,
         RATIO=int(ratio), OVERLAP=bool(overlap), ROWS=rows, BLOCK=BLOCK, num_warps=4,
     )
     return pooled

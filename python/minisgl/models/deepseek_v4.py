@@ -291,9 +291,7 @@ class DSV4Compressor(BaseOP):
                 kv, sc, self.ape, pos, md.tok_table, state_kv, state_sc,
                 ratio=ratio, overlap=self.overlap, head_dim=d,
             )
-            rows = md.comp_write[ratio]
-            rows = torch.where(rows >= 0, rows + row_base, rows)
-            self._store(pooled, md.group_start[ratio], cos, sin, out_buf, rows, quant, had)
+            self._store(pooled, md.group_start[ratio], cos, sin, out_buf, md.comp_write[ratio], quant, had, row_base)
             return
         pooled_all, rows_all, gpos_all = [], [], []
         page_table = get_global_ctx().page_table
@@ -312,13 +310,14 @@ class DSV4Compressor(BaseOP):
                 quant, had,
             )
 
-    def _store(self, pooled, gpos, cos, sin, out_buf, rows, quant, had) -> None:
+    def _store(self, pooled, gpos, cos, sin, out_buf, rows, quant, had, row_base: int = 0) -> None:
         """Completed compressed entries -> cache rows. The indexer cache (uint8)
         holds paged FP8 keys + FP32 scales (sglang's DeepGEMM layout); attention
         rows are BF16 576-wide."""
         if out_buf.dtype == torch.uint8:
             from minisgl.kernel.dsv4_sgl import store_index_keys
 
+            assert row_base == 0
             store_index_keys(
                 pooled, self.norm.weight, gpos, cos, sin, had, out_buf, rows, eps=self._eps, rope_dim=self._rope_dim
             )
@@ -327,7 +326,7 @@ class DSV4Compressor(BaseOP):
 
         kv_norm_rope_store(
             pooled, self.norm.weight, gpos, cos, sin, out_buf, rows,
-            eps=self._eps, rope_dim=self._rope_dim, quant=quant, hadamard=had,
+            eps=self._eps, rope_dim=self._rope_dim, quant=quant, hadamard=had, row_base=row_base,
         )
 
     def _prefill_seq(self, kv, sc, seq, state_kv, state_sc):
@@ -470,8 +469,7 @@ class DSV4Indexer(BaseOP):
                                   get_global_ctx().attn_backend.max_c4_len)
         out = torch.empty((T, self.topk), dtype=torch.int32, device=x.device)
         topk_transform_v2(logits, c4_lens, md.c4_bt, out, 64, md.topk_plan)
-        rows = torch.where(out >= 0, out + pool.comp_base, -1)
-        return rows, torch.clamp(c4_lens, max=self.topk)
+        return out, c4_lens  # c4 rows relative to comp_base (attn_index adds it), count clamped there
 
 
 def _index_keys(cache: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
@@ -586,13 +584,16 @@ class DSV4Attention(BaseOP):
             eps=self._eps, rope_dim=self._rope_dim, quant=1,
         )
         comp = cnt = None
+        comp_off = 0
         if self.ratio:
             self.compressor.run(x, md, cos, sin, pool.state_kv[l], pool.state_score[l], layer_kv, pool.comp_base)
             if self.ratio == 4:
                 comp, cnt = self.indexer.run(x, qr, md, cos, sin, pool, l)
+                if md.is_decode and md.c4_bt is not None:
+                    comp_off = pool.comp_base  # sglang top-k path returns rows relative to the c4 region
             else:
                 comp, cnt = md.c128_idx, md.n128_valid
-        idx, seq_lens = backend.attn_index(md, comp, cnt)
+        idx, seq_lens = backend.attn_index(md, comp, cnt, comp_off)
         o = backend.sparse_attn(q, layer_kv, idx, self.attn_sink, self.head_dim**-0.5, seq_lens)
         # persist this forward's window kv into the per-request ring
         if md.ring_src.numel():
@@ -774,23 +775,29 @@ class DSV4Block(BaseOP):
         if a.indexer is not None:
             a.indexer.compressor.merge_weights()
 
-    def hc_pre(self, x, fn, scale, base):
-        from minisgl.kernel.dsv4_triton import hc_pre_fused, hc_prenorm_mixes
+    def hc_pre(self, x, fn, scale, base, norm: RMSNorm | None = None):
+        """mHC pre (+ the following RMSNorm when ``norm`` is given)."""
+        from minisgl.kernel.dsv4_triton import hc_pre_fused, hc_pre_split, hc_pre_split_supported, hc_prenorm_mixes
 
-        mixes = hc_prenorm_mixes(x, fn, self._args.eps)
-        return hc_pre_fused(x, mixes, scale, base, sinkhorn_iters=self._args.hc_iters, eps=self._args.hc_eps)
+        a = self._args
+        if hc_pre_split_supported(x, fn):
+            return hc_pre_split(
+                x, fn, scale, base, rms_eps=a.eps, sinkhorn_iters=a.hc_iters, eps=a.hc_eps,
+                norm_weight=norm.weight if norm is not None else None, norm_eps=norm.eps if norm is not None else a.eps,
+            )
+        mixes = hc_prenorm_mixes(x, fn, a.eps)
+        h, post, comb = hc_pre_fused(x, mixes, scale, base, sinkhorn_iters=a.hc_iters, eps=a.hc_eps)
+        return (norm.forward(h) if norm is not None else h), post, comb
 
     def attention_part(self, x: torch.Tensor) -> tuple[torch.Tensor, DSV4Residual]:
         from minisgl.kernel.dsv4_triton import hc_post_fused
 
-        h, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        h = self.attn_norm.forward(h)
+        h, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self.attn_norm)
         debug_taps.tap(f"L{self._layer_id}.attn_in", h)
         a = self.attn.forward(h)
         debug_taps.tap(f"L{self._layer_id}.attn_out", a)
         x = hc_post_fused(a, x, post, comb)
-        h, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        h = self.ffn_norm.forward(h)
+        h, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base, self.ffn_norm)
         return h, DSV4Residual(x, post, comb)
 
     @nvtx_annotate("DSV4Layer_{}", layer_id_field="_layer_id")
