@@ -264,12 +264,12 @@ C128; K3: 69 KDA + 24 MLA).
 | DSV4-Flash | 2 | 8 | 409 / 156 | 450 / 161 |
 | DSV4-Flash | 2 | 32 | 596 / 171 | 703 / 179 |
 | DSV4-Flash | 2 | 128 | 817 / 214 | 1201 / 228 |
-| Kimi-K3 | 1 | 8 | 410 / 272 | 474 / 283 |
-| Kimi-K3 | 1 | 32 | 504 / 331 | 789 / 380 |
-| Kimi-K3 | 1 | 128 | 779 / 556 | 1762 / 737 |
-| Kimi-K3 | 2 | 8 | 362 / 229 | 389 / 240 |
-| Kimi-K3 | 2 | 32 | 427 / 281 | 617 / 327 |
-| Kimi-K3 | 2 | 128 | 607 / 421 | 1177 / 619 |
+| Kimi-K3 | 1 | 8 | 410 / 269 | 474 / 287 |
+| Kimi-K3 | 1 | 32 | 504 / 329 | 789 / 377 |
+| Kimi-K3 | 1 | 128 | 779 / 545 | 1762 / 730 |
+| Kimi-K3 | 2 | 8 | 362 / 224 | 389 / 237 |
+| Kimi-K3 | 2 | 32 | 427 / 274 | 617 / 325 |
+| Kimi-K3 | 2 | 128 | 607 / 413 | 1177 / 601 |
 
 **Attention core vs sglang** (`--core`; boundary of the sglang kernel benchmark:
 DSV4 compressors + indexer + top-k + sparse MLA, K3 KDA conv/recurrence/gated
@@ -280,18 +280,20 @@ FastAFD / sglang:
 |---|---:|---|---|---|
 | DSV4-Flash | 1 | 27.1/27.3, 29.2/30.6 | 37.6/31.1, 45.3/36.7 | 70.7/37.3, 84.3/52.3 |
 | DSV4-Flash | 2 | 25.5/27.1, 27.6/30.5 | 34.7/31.2, 42.0/37.0 | 64.8/37.1, 79.5/52.1 |
-| Kimi-K3 | 1 | 30.9/30.7, 43.5/43.1 | 89.6/79.4, 135.7/140.8 | 296.0/264.0, 480.1/490.0 |
-| Kimi-K3 | 2 | 23.3/25.2, 36.9/37.0 | 56.2/53.3, 102.3/104.3 | 169.7/154.6, 352.3/348.3 |
+| Kimi-K3 | 1 | 28.6/30.7, 40.4/43.1 | 85.0/79.4, 131.2/140.8 | 286.0/264.0, 470.3/490.0 |
+| Kimi-K3 | 2 | 21.5/25.2, 33.7/37.0 | 53.0/53.3, 99.5/104.3 | 163.8/154.6, 349.3/348.3 |
 
-K3 is within 0.92-1.13x of sglang everywhere. DSV4 is at parity for B <= 8,
+K3 is within 0.85-1.08x of sglang everywhere (per layer type: KDA 0.80-1.08x, MLA
+0.81-1.15x). DSV4 is at parity for B <= 8,
 1.1-1.2x at B=32 and 1.5-1.9x at B=128; the gap is the sparse MLA kernel:
 sglang runs FlashMLA's SM100 FP8 sparse decode (sgl_kernel, 584 B/token), which
 is a compiled op outside this environment; flashinfer 0.6.6's trtllm-gen sparse
 MLA on BF16 rows is used instead (with the query padded to 128 heads at large
 batch x top-k: 43 us vs 27 us for the C4 layer at B=128, C=32K). K3 MLA at TP1
 compares against sglang's CuTe-DSL MLA (flashinfer 0.6.17; sglang's trtllm-gen
-default rejects 96 heads); at TP2, padding 48 -> 64 heads costs 20-40% at
-B <= 32 against flashinfer 0.6.17's 48-head kernel.
+default rejects 96 heads); at TP2 the 48 heads are padded to 64 (flashinfer 0.6.17
+has a 48-head kernel) and MLA stays within 0.96-1.15x. The padded [q_abs | q_rope]
+query is built in one Triton pass.
 
 **Kernel map (decode)**, sglang kernel used unless noted:
 
