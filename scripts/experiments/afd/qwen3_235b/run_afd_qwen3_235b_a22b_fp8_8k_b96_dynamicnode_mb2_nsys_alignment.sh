@@ -18,9 +18,9 @@ TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
 #
 # Node policy:
 #   - AFD_TOTAL_NODES controls how many Ray GPU nodes to use.
-#   - Exactly one node is used for MLP: MLP dp=4, ep=4.
+#   - AFD_MLP_NODE_COUNT nodes (default 1) are used for MLP: MLP dp = ep = 4 per node.
 #   - Every remaining node is used for attention: 4 attention DP ranks/node.
-#   - By default, the last node in AFD_NODE_LIST is the MLP node.
+#   - By default, the last node(s) in AFD_NODE_LIST are the MLP node(s).
 #
 # Override examples:
 #   AFD_TOTAL_NODES=14 bash scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_8k_b96_dynamicnode_mb2_nsys_alignment.sh
@@ -65,17 +65,25 @@ if (( ${#_AFD_NODES[@]} < 2 )); then
   exit 1
 fi
 
-export AFD_MLP_NODE="${AFD_MLP_NODE:-${_AFD_NODES[$((${#_AFD_NODES[@]} - 1))]}}"
+export AFD_MLP_NODE_COUNT="${AFD_MLP_NODE_COUNT:-1}"
+if [[ -n "${AFD_MLP_NODE:-}" ]]; then
+  IFS=',' read -r -a _MLP_NODES <<< "$AFD_MLP_NODE"
+else
+  _MLP_NODES=("${_AFD_NODES[@]: -$AFD_MLP_NODE_COUNT}")
+fi
+export AFD_MLP_NODE="$(IFS=,; echo "${_MLP_NODES[*]}")"
 _ATTN_NODES=()
 _MLP_SEEN=0
 for node in "${_AFD_NODES[@]}"; do
-  if [[ "$node" == "$AFD_MLP_NODE" && "$_MLP_SEEN" == "0" ]]; then
-    _MLP_SEEN=1
+  _is_mlp=0
+  for mnode in "${_MLP_NODES[@]}"; do [[ "$node" == "$mnode" ]] && _is_mlp=1; done
+  if (( _is_mlp )); then
+    _MLP_SEEN=$(( _MLP_SEEN + 1 ))
     continue
   fi
   _ATTN_NODES+=("$node")
 done
-if [[ "$_MLP_SEEN" == "0" ]]; then
+if (( _MLP_SEEN != ${#_MLP_NODES[@]} )); then
   echo "AFD_MLP_NODE=$AFD_MLP_NODE is not present in AFD_NODE_LIST=$AFD_NODE_LIST" >&2
   exit 1
 fi
@@ -99,15 +107,15 @@ PY
 }
 
 export MINISGL_AFD_ATTN_NODES="${MINISGL_AFD_ATTN_NODES:-$(_repeat_nodes "$AFD_GPUS_PER_NODE" "${_ATTN_NODES[@]}")}"
-export MINISGL_AFD_MLP_NODES="${MINISGL_AFD_MLP_NODES:-$(_repeat_nodes "$AFD_GPUS_PER_NODE" "$AFD_MLP_NODE")}"
+export MINISGL_AFD_MLP_NODES="${MINISGL_AFD_MLP_NODES:-$(_repeat_nodes "$AFD_GPUS_PER_NODE" "${_MLP_NODES[@]}")}"
 
 export AFD_ATTN_DP_SIZE="$(( ${#_ATTN_NODES[@]} * AFD_GPUS_PER_NODE ))"
 export ATTN_DP_SIZE="$AFD_ATTN_DP_SIZE"
 export AFD_ATTN_TP_SIZE="${AFD_ATTN_TP_SIZE:-1}"
 export ATTN_TP_SIZE="$AFD_ATTN_TP_SIZE"
-export MLP_DP_SIZE="4"
+export MLP_DP_SIZE="$(( ${#_MLP_NODES[@]} * AFD_GPUS_PER_NODE ))"
 export MLP_TP_SIZE="1"
-export AFD_MLP_EP_SIZE="4"
+export AFD_MLP_EP_SIZE="$MLP_DP_SIZE"
 
 export NUM_PROMPTS="${NUM_PROMPTS:-$(( PER_ATTN_GPU_BSZ * AFD_ATTN_DP_SIZE ))}"
 export AFD_BATCH_SIZE="${AFD_BATCH_SIZE:-$NUM_PROMPTS}"
