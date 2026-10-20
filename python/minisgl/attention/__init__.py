@@ -50,9 +50,9 @@ def create_kimi_backend(config: ModelConfig):
 def model_attention_backend(config: ModelConfig) -> tuple[str, int] | None:
     """(backend, page_size) forced by architectures with non-MHA attention."""
     if getattr(config, "is_deepseek_v4", False):
-        return "dsv4", 128
+        return "dsv4", 256  # sglang's DSV4 page size (64 c4 entries per page)
     if getattr(config, "is_kimi_k3", False):
-        return "kimi", 1
+        return "kimi", 64  # trtllm-gen MLA decode pages (sglang trtllm_mla: 64)
     return None
 
 

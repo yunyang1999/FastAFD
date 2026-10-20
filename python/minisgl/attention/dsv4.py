@@ -54,6 +54,10 @@ class DSV4Metadata(BaseAttnMetadata):
     seq_lens: torch.Tensor  # [T] int32 kernel seq_lens
     cu_seqlens_q: torch.Tensor  # [B+1] int32 (gpu)
     prefill_seqs: List[DSV4PrefillSeq] = field(default_factory=list)
+    # sglang indexer path (decode): c4 block table / DeepGEMM schedule / top-k plan
+    c4_bt: torch.Tensor | None = None  # [T, NP] int32 page ids (64 c4 entries per page)
+    dg_sched: torch.Tensor | None = None  # [num_sms + 1, 2] int32
+    topk_plan: torch.Tensor | None = None  # [T + 1, 2] int32
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q[1 : 1 + bs] - 1
@@ -79,6 +83,14 @@ class DSV4AttnBackend(BaseAttnBackend):
         self.capture: Dict[str, torch.Tensor] | None = None
         self.capture_bs: List[int] = []
         self._capture_meta: Dict[int, DSV4Metadata] = {}
+        import os
+
+        self.indexer_impl = os.environ.get("MINISGL_DSV4_INDEXER", "sglang").lower()
+        self.page_size = int(ctx.page_size)
+        if self.indexer_impl == "sglang" and self.page_size != 256 and any(r == 4 for r in self.ratios):
+            raise ValueError("the sglang DSV4 indexer path needs page_size=256 (64 c4 entries per page)")
+        self.n_c4_pages = (self.max_seq_len + self.page_size - 1) // self.page_size
+        self.max_c4_len = self.n_c4_pages * (self.page_size // 4)
 
     # ------------------------------------------------------------------
     # metadata
@@ -146,9 +158,21 @@ class DSV4AttnBackend(BaseAttnBackend):
         n128_valid = ((pos + 1) // 128).to(torch.int32)
         n_window = (pos + 1).clamp(max=W).to(torch.int32)
         c4_rows = None
+        c4_bt = dg_sched = topk_plan = None
         if is_decode and any(r == 4 for r in self.ratios):
-            cols4 = (self._c4.long() * 4).clamp(max=page_table.shape[1] - 1)
-            c4_rows = (page_table[tt[:, None], cols4[None, :]] // 4).long()
+            if self.indexer_impl == "sglang":
+                from minisgl.kernel.dsv4_sgl import paged_mqa_schedule, plan_topk_v2
+
+                P = self.page_size
+                c4_bt = torch.div(page_table[:, : self.n_c4_pages * P : P][tt], P, rounding_mode="floor").to(torch.int32)
+                if c4_bt.shape[1] < self.n_c4_pages:
+                    c4_bt = torch.nn.functional.pad(c4_bt, (0, self.n_c4_pages - c4_bt.shape[1]))
+                c4_lens = ((pos + 1) // 4).to(torch.int32)
+                dg_sched = paged_mqa_schedule(c4_lens)
+                topk_plan = plan_topk_v2(c4_lens)
+            else:
+                cols4 = (self._c4.long() * 4).clamp(max=page_table.shape[1] - 1)
+                c4_rows = (page_table[tt[:, None], cols4[None, :]] // 4).long()
         comp_write: Dict[int, torch.Tensor] = {}
         group_start: Dict[int, torch.Tensor] = {}
         for r in sorted({x for x in self.ratios if x}):
@@ -183,6 +207,9 @@ class DSV4AttnBackend(BaseAttnBackend):
             seq_lens=seq_lens,
             cu_seqlens_q=cu,
             prefill_seqs=prefill_seqs,
+            c4_bt=c4_bt,
+            dg_sched=dg_sched,
+            topk_plan=topk_plan,
         )
         return md
 
@@ -195,6 +222,7 @@ class DSV4AttnBackend(BaseAttnBackend):
     _GRAPH_FIELDS = (
         "tok_table", "tok_cached", "scratch_rows", "window_idx", "ring_src", "ring_dst",
         "c128_idx", "c4_rows", "n4_valid", "n128_valid", "n_window", "seq_lens", "cu_seqlens_q",
+        "c4_bt", "dg_sched", "topk_plan",
     )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

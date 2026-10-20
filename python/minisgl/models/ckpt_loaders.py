@@ -249,6 +249,10 @@ class _DSV4Source:
             raise KeyError(f"no DeepSeek-V4 checkpoint mapping for {name}")
         layer, rest = int(m.group(1)), m.group(2)
         src = self._src(layer)
+        if rest == "attn.wo_a_q.weight":
+            return r.get(src + "attn.wo_a.weight")
+        if rest == "attn.wo_a_q.weight_scale":
+            return e8m0_to_float(r.get(src + "attn.wo_a.scale"))
         if rest == "attn.wo_a":
             from .fp8_utils import dequant_fp8_block
 

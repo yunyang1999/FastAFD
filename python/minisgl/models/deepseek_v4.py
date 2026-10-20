@@ -129,6 +129,12 @@ class DSV4Args:
         )
 
 
+# "sglang": vendored sglang 0.5.18 decode kernels; "legacy": the reference-style kernels
+_ROUTER_IMPL = os.environ.get("MINISGL_DSV4_ROUTER", "sglang").lower()
+_ATTN_ELEMWISE_IMPL = os.environ.get("MINISGL_DSV4_ATTN_ELEMWISE", "sglang").lower()
+_WO_A_FP8 = os.environ.get("MINISGL_DSV4_WO_A", "fp8").lower() == "fp8"
+
+
 def rope_table_len() -> int:
     return int(os.environ.get("MINISGL_ROPE_TABLE_LEN", str(1 << 17)))
 
@@ -190,14 +196,37 @@ class LinearReplicatedQ(_LinearTPImpl):
             self.weight = torch.empty(out_features, in_features, dtype=dtype)
 
 
+class Fp8BlockWeight(BaseOP):
+    """FP8 (e4m3) weight with FP32 (UE8M0-valued) 128x128 block scales."""
+
+    def __init__(self, rows: int, cols: int):
+        self.weight = torch.empty(rows, cols, dtype=torch.float8_e4m3fn)
+        self.weight_scale = torch.empty((rows + 127) // 128, (cols + 127) // 128, dtype=torch.float32)
+
+    def forward(self, *a, **k):  # pragma: no cover
+        raise RuntimeError("weight holder")
+
+
 class Fp32Linear(BaseOP):
-    """y = x.float() @ W^T with an fp32 weight (reference: gate, compressor)."""
+    """y = x @ W^T with fp32 output (reference: gate, compressor).
+
+    The checkpoint stores these weights in BF16; as in sglang (``linear_bf16_fp32``)
+    the GEMM runs on BF16 operands with FP32 accumulation and output, which equals
+    the reference fp32 product of the same BF16 values up to summation order.
+    """
 
     def __init__(self, in_features: int, out_features: int):
-        self.weight = torch.empty(out_features, in_features, dtype=torch.float32)
+        self.weight = torch.empty(out_features, in_features, dtype=torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x.float(), self.weight)
+        return linear_bf16_fp32(x, self.weight)
+
+
+def linear_bf16_fp32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """BF16 x BF16 -> FP32 GEMM (cuBLAS), x [T, K], w [N, K]."""
+    if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
+        return F.linear(x.float(), w.float())
+    return torch.mm(x, w.t(), out_dtype=torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +248,17 @@ class DSV4Compressor(BaseOP):
         self.norm = RMSNorm(head_dim, eps=args.eps)
         self._eps = args.eps
         self._rope_dim = args.rope_dim
+        self._w_kv_gate: torch.Tensor | None = None
+        self._n_kv = coff * head_dim
+
+    def merge_weights(self) -> None:
+        """wkv|wgate as one BF16 weight (sglang ``wkv_gate``); the modules keep views."""
+        if self._w_kv_gate is not None:
+            return
+        w = torch.cat([self.wkv.weight, self.wgate.weight], dim=0)
+        n = self.wkv.weight.shape[0]
+        self.wkv.weight, self.wgate.weight = w[:n], w[n:]
+        self._w_kv_gate = w
 
     def forward(self, *a, **k):  # pragma: no cover
         raise RuntimeError("use run()")
@@ -241,8 +281,10 @@ class DSV4Compressor(BaseOP):
         ratio, d = self.ratio, self.head_dim
         quant = 2 if self.rotate else 1
         had = hadamard_matrix(d, str(x.device)) if self.rotate else None
-        kv = self.wkv.forward(x)
-        sc = self.wgate.forward(x)
+        if self._w_kv_gate is None:
+            self.merge_weights()
+        kvsc = linear_bf16_fp32(x, self._w_kv_gate)
+        kv, sc = kvsc[:, : self._n_kv], kvsc[:, self._n_kv :]
         pos = get_global_ctx().batch.positions
         if md.is_decode:
             pooled = compressor_decode_step(
@@ -251,10 +293,7 @@ class DSV4Compressor(BaseOP):
             )
             rows = md.comp_write[ratio]
             rows = torch.where(rows >= 0, rows + row_base, rows)
-            kv_norm_rope_store(
-                pooled, self.norm.weight, md.group_start[ratio], cos, sin, out_buf, rows,
-                eps=self._eps, rope_dim=self._rope_dim, quant=quant, hadamard=had,
-            )
+            self._store(pooled, md.group_start[ratio], cos, sin, out_buf, rows, quant, had)
             return
         pooled_all, rows_all, gpos_all = [], [], []
         page_table = get_global_ctx().page_table
@@ -268,10 +307,28 @@ class DSV4Compressor(BaseOP):
             rows_all.append(rows)
             gpos_all.append(gpos)
         if pooled_all:
-            kv_norm_rope_store(
-                torch.cat(pooled_all), self.norm.weight, torch.cat(gpos_all).to(torch.int32), cos, sin,
-                out_buf, torch.cat(rows_all), eps=self._eps, rope_dim=self._rope_dim, quant=quant, hadamard=had,
+            self._store(
+                torch.cat(pooled_all), torch.cat(gpos_all).to(torch.int32), cos, sin, out_buf, torch.cat(rows_all),
+                quant, had,
             )
+
+    def _store(self, pooled, gpos, cos, sin, out_buf, rows, quant, had) -> None:
+        """Completed compressed entries -> cache rows. The indexer cache (uint8)
+        holds paged FP8 keys + FP32 scales (sglang's DeepGEMM layout); attention
+        rows are BF16 576-wide."""
+        if out_buf.dtype == torch.uint8:
+            from minisgl.kernel.dsv4_sgl import store_index_keys
+
+            store_index_keys(
+                pooled, self.norm.weight, gpos, cos, sin, had, out_buf, rows, eps=self._eps, rope_dim=self._rope_dim
+            )
+            return
+        from minisgl.kernel.dsv4_triton import kv_norm_rope_store
+
+        kv_norm_rope_store(
+            pooled, self.norm.weight, gpos, cos, sin, out_buf, rows,
+            eps=self._eps, rope_dim=self._rope_dim, quant=quant, hadamard=had,
+        )
 
     def _prefill_seq(self, kv, sc, seq, state_kv, state_sc):
         ratio, d, ov = self.ratio, self.head_dim, self.overlap
@@ -347,19 +404,21 @@ class DSV4Indexer(BaseOP):
 
         dev = x.device
         T = x.shape[0]
+        keys = pool.idx_keys[layer_id]
+        self.compressor.run(
+            x, md, cos, sin, pool.idx_state_kv[layer_id], pool.idx_state_score[layer_id], keys, 0
+        )
+        if md.is_decode and md.c4_bt is not None:
+            return self._decode_sglang(x, qr, md, cos, sin, pool, keys)
         had = hadamard_matrix(self.head_dim, str(dev))
         q = self.wq_b.forward(qr).view(T, self.n_heads, self.head_dim)
         pos = get_global_ctx().batch.positions
         q_norm_rope_(q, pos, cos, sin, eps=0.0, rope_dim=self._rope_dim, do_norm=False, hadamard=had)
         # reference precision: bf16 scores / weights (einsum of bf16 tensors)
         w = self.weights_proj.forward(x) * self._scale  # [T, H] bf16
-        keys = pool.idx_keys[layer_id]
-        self.compressor.run(
-            x, md, cos, sin, pool.idx_state_kv[layer_id], pool.idx_state_score[layer_id], keys, 0
-        )
         page_table = get_global_ctx().page_table
         if md.is_decode:
-            k_all = keys[md.c4_rows]  # [T, n4, D]
+            k_all = _index_keys(keys, md.c4_rows)  # [T, n4, D]
             s = torch.bmm(q, k_all.transpose(1, 2))  # [T, H, n4] bf16
             s = (s.relu_() * w.unsqueeze(-1)).sum(1).float()  # [T, n4]
             n4 = s.shape[1]
@@ -379,7 +438,7 @@ class DSV4Indexer(BaseOP):
             if n_c == 0:
                 continue
             crow = page_table[seq.table_idx, torch.arange(n_c, device=dev) * 4].long() // 4
-            ks = keys[crow]  # [n_c, D] bf16
+            ks = _index_keys(keys, crow)  # [n_c, D] bf16
             for c0 in range(seq.tok_start, seq.tok_end, 256):
                 c1 = min(c0 + 256, seq.tok_end)
                 s = torch.einsum("thd,cd->thc", q[c0:c1], ks)
@@ -393,6 +452,34 @@ class DSV4Indexer(BaseOP):
                 out_rows[c0:c1, :k] = rows
         cnt = torch.clamp(md.n4_valid, max=k_cap)
         return out_rows, cnt
+
+
+    def _decode_sglang(self, x, qr, md, cos, sin, pool, keys) -> tuple[torch.Tensor, torch.Tensor]:
+        """sglang 0.5.18 decode indexer: q RoPE + Hadamard + FP8 quant (head weights
+        folded), DeepGEMM paged FP8 MQA logits over the c4 key cache, fused
+        top-512 + page-table transform (top-k v2)."""
+        from minisgl.kernel.dsv4_sgl import fused_q_indexer_quant, freqs_real, paged_mqa_logits, topk_transform_v2
+
+        T = x.shape[0]
+        pos = get_global_ctx().batch.positions
+        q = self.wq_b.forward(qr).view(T, self.n_heads, self.head_dim)
+        w = self.weights_proj.forward(x)  # [T, H] bf16
+        q_fp8, w_out = fused_q_indexer_quant(q, w, self._scale, freqs_real(cos, sin), pos)
+        c4_lens = md.n4_valid
+        logits = paged_mqa_logits(q_fp8, keys, w_out.view(T, self.n_heads), c4_lens, md.c4_bt, md.dg_sched,
+                                  get_global_ctx().attn_backend.max_c4_len)
+        out = torch.empty((T, self.topk), dtype=torch.int32, device=x.device)
+        topk_transform_v2(logits, c4_lens, md.c4_bt, out, 64, md.topk_plan)
+        rows = torch.where(out >= 0, out + pool.comp_base, -1)
+        return rows, torch.clamp(c4_lens, max=self.topk)
+
+
+def _index_keys(cache: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """BF16 indexer keys of c4 ``rows`` (any shape) from the paged FP8 cache."""
+    from minisgl.kernel.dsv4_sgl import gather_index_keys
+
+    flat = rows.reshape(-1)
+    return gather_index_keys(cache, flat).view(*rows.shape, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -420,11 +507,51 @@ class DSV4Attention(BaseOP):
         self.wkv = LinearReplicatedQ(args.dim, args.head_dim, quant=quant)
         self.kv_norm = RMSNorm(args.head_dim, eps=args.eps)
         in_g = args.n_heads * args.head_dim // args.o_groups
-        self.wo_a = torch.empty(self.n_groups_local * args.o_lora_rank, in_g, dtype=torch.bfloat16)
+        self._in_g = in_g
+        if _WO_A_FP8 and quant is not None:
+            # sglang FP8_WO_A_GEMM: FP8 block-quantised wo_a + DeepGEMM grouped einsum
+            self.wo_a_q = Fp8BlockWeight(self.n_groups_local * args.o_lora_rank, in_g)
+            self._wo_a_sf: torch.Tensor | None = None
+        else:
+            self.wo_a = torch.empty(self.n_groups_local * args.o_lora_rank, in_g, dtype=torch.bfloat16)
+            self.wo_a_q = None
         self.wo_b = LinearRowParallel(args.o_groups * args.o_lora_rank, args.dim, has_bias=False, quant=quant)
         self.attn_sink = torch.empty(self.n_local, dtype=torch.float32)
         self.compressor = DSV4Compressor(args, self.ratio, args.head_dim, rotate=False) if self.ratio else None
         self.indexer = DSV4Indexer(args, quant) if self.ratio == 4 else None
+        self._w_qkv_a: LinearReplicatedQ | None = None
+
+    def merge_weights(self) -> None:
+        """wq_a | wkv as one FP8 block-quantised GEMM (sglang FUSE_WQA_WKV)."""
+        if self._w_qkv_a is not None or _ATTN_ELEMWISE_IMPL != "sglang":
+            return
+        a, b = self.wq_a, self.wkv
+        m = LinearReplicatedQ.__new__(LinearReplicatedQ)
+        m.__dict__.update(a.__dict__)
+        if a._bf16_weight is not None or b._bf16_weight is not None:
+            # BF16-cuBLAS mode (weights dequantised at load): merge the BF16 copies
+            wa = a._bf16_weight if a._bf16_weight is not None else a._dequant_weight_to_bf16()
+            wb = b._bf16_weight if b._bf16_weight is not None else b._dequant_weight_to_bf16()
+            m._bf16_weight = torch.cat([wa, wb], dim=0)
+            a._bf16_weight, b._bf16_weight = m._bf16_weight[: wa.shape[0]], m._bf16_weight[wa.shape[0] :]
+        elif a.weight.dtype == torch.float8_e4m3fn:
+            if a.weight.shape[0] % 128 or a._fp8_block_size != (128, 128) or b._fp8_block_size != (128, 128):
+                return
+            n = a.weight.shape[0]
+            m.weight = torch.cat([a.weight, b.weight], dim=0)
+            m.weight_scale = torch.cat([a.weight_scale, b.weight_scale], dim=0)
+            m._fp8_weight_scale_for_deepgemm = None
+            m._fp8_weight_for_deepgemm()
+            a.weight, b.weight = m.weight[:n], m.weight[n:]
+        else:
+            n = a.weight.shape[0]
+            m.weight = torch.cat([a.weight, b.weight], dim=0)
+            a.weight, b.weight = m.weight[:n], m.weight[n:]
+        m.local_output_size = m.full_output_size = a.local_output_size + b.local_output_size
+        self._w_qkv_a = m
+
+    def _qkv_a_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._w_qkv_a.forward(x)
 
     @nvtx_annotate("DSV4Attn")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -438,10 +565,21 @@ class DSV4Attention(BaseOP):
         T = x.shape[0]
         l = self.layer_id
         cos, sin = layer_rope(self._args, self.ratio, x.device)
-        qr = self.q_norm.forward(self.wq_a.forward(x))
+        use_sgl = _ATTN_ELEMWISE_IMPL == "sglang" and md.is_decode
+        if self._w_qkv_a is not None:
+            qkv_a = self._qkv_a_forward(x)
+            qr = self.q_norm.forward(qkv_a[:, : self._args.q_lora_rank].contiguous())
+            kv = qkv_a[:, self._args.q_lora_rank :]
+        else:
+            qr = self.q_norm.forward(self.wq_a.forward(x))
+            kv = self.wkv.forward(x)
         q = self.wq_b.forward(qr).view(T, self.n_local, self.head_dim)
-        q_norm_rope_(q, pos, cos, sin, eps=self._eps, rope_dim=self._rope_dim)
-        kv = self.wkv.forward(x)
+        if use_sgl:
+            from minisgl.kernel.dsv4_sgl import freqs_real, fused_q_norm_rope
+
+            fused_q_norm_rope(q, q, self._eps, freqs_real(cos, sin), pos)
+        else:
+            q_norm_rope_(q, pos, cos, sin, eps=self._eps, rope_dim=self._rope_dim)
         layer_kv = pool.kv[l]
         kv_norm_rope_store(
             kv, self.kv_norm.weight, pos, cos, sin, layer_kv, md.scratch_rows,
@@ -459,10 +597,22 @@ class DSV4Attention(BaseOP):
         # persist this forward's window kv into the per-request ring
         if md.ring_src.numel():
             layer_kv.index_copy_(0, md.ring_dst, layer_kv.index_select(0, md.ring_src))
-        inverse_rope_(o, pos, cos, sin, self._rope_dim)
+        if use_sgl:
+            from minisgl.kernel.dsv4_sgl import freqs_real, fused_rope_inplace
+
+            fused_rope_inplace(o[..., -self._rope_dim :], freqs_real(cos, sin), pos, inverse=True)
+        else:
+            inverse_rope_(o, pos, cos, sin, self._rope_dim)
         o = o.reshape(T, self.n_groups_local, -1)
-        wo_a = self.wo_a.view(self.n_groups_local, self.o_lora, -1)
-        o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        if self.wo_a_q is not None:
+            from minisgl.kernel.dsv4_sgl import wo_a_einsum, wo_a_weight_sf
+
+            if self._wo_a_sf is None:
+                self._wo_a_sf = wo_a_weight_sf(self.wo_a_q.weight_scale, self.n_groups_local, self.o_lora, self._in_g)
+            o = wo_a_einsum(o, self.wo_a_q.weight.view(self.n_groups_local, self.o_lora, -1), self._wo_a_sf)
+        else:
+            wo_a = self.wo_a.view(self.n_groups_local, self.o_lora, -1)
+            o = torch.einsum("tgd,grd->tgr", o, wo_a)
         return self.wo_b.forward(o.flatten(1))
 
 
@@ -484,7 +634,7 @@ class DSV4TopK(NamedTuple):
 
 class DSV4Gate(BaseOP):
     def __init__(self, args: DSV4Args, layer_id: int):
-        self.weight = torch.empty(args.n_routed, args.dim, dtype=torch.float32)
+        self.weight = torch.empty(args.n_routed, args.dim, dtype=torch.bfloat16)  # checkpoint dtype
         self.is_hash = layer_id < args.n_hash_layers
         if self.is_hash:
             self.tid2eid = torch.empty(args.vocab, args.topk, dtype=torch.int32)
@@ -493,12 +643,24 @@ class DSV4Gate(BaseOP):
         self._topk = args.topk
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (ids int32 [T,k], normalised weights fp32 [T,k]) without rsf."""
-        scores = F.softplus(F.linear(x.float(), self.weight)).sqrt()
+        """Returns (ids int32 [T,k], normalised weights fp32 [T,k]) without rsf.
+
+        Router logits: BF16 GEMM with FP32 output; sqrt-softplus + bias top-k +
+        renormalisation in sglang's fused Triton router (hash layers: tid2eid)."""
+        logits = linear_bf16_fp32(x, self.weight)
         if self.is_hash:
+            scores = F.softplus(logits).sqrt()
             ids = self.tid2eid[get_global_ctx().batch.input_ids.long()].long()
-        else:
-            ids = (scores + self.bias).topk(self._topk, dim=-1).indices
+            w = scores.gather(1, ids)
+            w = w / w.sum(dim=-1, keepdim=True)
+            return ids.to(torch.int32), w
+        if _ROUTER_IMPL == "sglang":
+            from minisgl.kernel.sgl_triton.moe_router import moe_fused_gate
+
+            w, ids = moe_fused_gate(logits, self.bias, self._topk, scoring_func="sqrtsoftplus", renormalize=True)
+            return ids, w
+        scores = F.softplus(logits).sqrt()
+        ids = (scores + self.bias).topk(self._topk, dim=-1).indices
         w = scores.gather(1, ids)
         w = w / w.sum(dim=-1, keepdim=True)
         return ids.to(torch.int32), w
@@ -599,6 +761,19 @@ class DSV4Block(BaseOP):
         self._args = args
         self._layer_id = layer_id
 
+    def prepare(self) -> None:
+        """Post-load weight merges (must run before CUDA-graph capture)."""
+        a = self.attn
+        a.merge_weights()
+        if a.wo_a_q is not None and a._wo_a_sf is None:
+            from minisgl.kernel.dsv4_sgl import wo_a_weight_sf
+
+            a._wo_a_sf = wo_a_weight_sf(a.wo_a_q.weight_scale, a.n_groups_local, a.o_lora, a._in_g)
+        if a.compressor is not None:
+            a.compressor.merge_weights()
+        if a.indexer is not None:
+            a.indexer.compressor.merge_weights()
+
     def hc_pre(self, x, fn, scale, base):
         from minisgl.kernel.dsv4_triton import hc_pre_fused, hc_prenorm_mixes
 
@@ -676,6 +851,8 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def post_load(self, *, max_tokens_per_rank: int) -> None:
         """Build the colocated MoE executor (MegaMoE) after weights are loaded."""
         args = self.model._args
+        for layer in self.model.layers.op_list:
+            layer.prepare()
         if os.environ.get("MINISGL_DSV4_SHARED_MXFP4", "0") == "1":
             # Emulate the AFD placement, where the shared expert runs inside the
             # MegaMoE stage with MXFP4 weights (re-quantised from FP8).

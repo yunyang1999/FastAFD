@@ -11,7 +11,9 @@ with ``R = max_running_req + 1`` (last = graph dummy), ``S`` the max tokens per
 forward and ``N = num_pages * page_size`` token slots. ``page_size`` must be a
 multiple of the largest compression ratio so a compressed group never spans
 pages. C4 layers additionally own an indexer-key buffer ``[N/4, 128]`` and all
-compressed layers own fp32 compressor states (kv, score) per request.
+compressed layers own fp32 compressor states (kv, score) per request. Indexer
+keys are FP8 with a per-entry FP32 scale in pages of 64 c4 entries (page_size
+must be 256 so a c4 page never spans two token pages).
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ class DSV4CacheSpec:
             if r:
                 b += ROW_DIM * 2 / r
             if r == 4:
-                b += self.index_head_dim * 2 / 4
+                b += (self.index_head_dim + 4) / 4  # FP8 key + FP32 scale per c4 entry
         return b
 
     def bytes_per_request(self) -> int:
@@ -128,7 +130,10 @@ class DSV4KVPool(BaseKVCachePool):
                 self.state_score.append(None)
             if r == 4:
                 di = spec.index_head_dim
-                self.idx_keys.append(torch.zeros(self.num_tokens // 4, di, dtype=torch.bfloat16, device=device))
+                # paged FP8 indexer keys (DeepGEMM fused layout): per page of 64
+                # c4 entries, 64 x di FP8 values then 64 FP32 scales
+                n_idx_pages = (self.num_tokens // 4 + 63) // 64
+                self.idx_keys.append(torch.zeros(n_idx_pages, 64 * (di + 4), dtype=torch.uint8, device=device))
                 self.idx_state_kv.append(torch.zeros(R, 8, 2 * di, dtype=torch.float32, device=device))
                 self.idx_state_score.append(
                     torch.full((R, 8, 2 * di), float("-inf"), dtype=torch.float32, device=device)

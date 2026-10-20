@@ -31,6 +31,10 @@ class DeepseekV4AfdAttention(BaseOP):
     def forward(self, *a, **k):  # pragma: no cover
         raise RuntimeError("AFD stage model is driven by the AFD worker")
 
+    def post_load(self, **_) -> None:
+        for layer in self.model.layers.op_list:
+            layer.prepare()
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> ModelStageState:
         return ModelStageState(hidden_states=self.model.embed_hc(input_ids), residual=None)
 

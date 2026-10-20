@@ -46,8 +46,8 @@ MAX_RUNNING=$NUM_REQ_TOTAL
 
 ARCH=$(python -c "import json;c=json.load(open('$MODEL_PATH/config.json'));print(c.get('model_type',''))")
 case "$ARCH" in
-  deepseek_v4) ATTN_BACKEND=dsv4; PAGE_SIZE=128 ;;
-  kimi_k3|kimi_linear) ATTN_BACKEND=kimi; PAGE_SIZE=1 ;;
+  deepseek_v4) ATTN_BACKEND=dsv4; PAGE_SIZE=256 ;;
+  kimi_k3|kimi_linear) ATTN_BACKEND=kimi; PAGE_SIZE=64 ;;
   *) echo "unsupported model_type $ARCH" >&2; exit 2 ;;
 esac
 

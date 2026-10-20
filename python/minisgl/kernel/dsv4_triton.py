@@ -196,11 +196,79 @@ def hc_head_fused(
     return y
 
 
-def hc_prenorm_mixes(x: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+def hc_prenorm_mixes_ref(x: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
     """mixes = (x_flat @ hc_fn^T) * rsqrt(mean(x_flat^2) + eps), all fp32 (reference)."""
     x_flat = x.flatten(1).float()
     rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + eps)
     return torch.mm(x_flat, hc_fn.t()) * rsqrt
+
+
+@triton.jit
+def _hc_mix_reduce_kernel(
+    d_ptr,  # [S, T, N] fp32 split-K partial products
+    sq_ptr,  # [S, T] fp32 split-K partial sums of squares
+    out_ptr,  # [T, N] fp32
+    T,
+    S,
+    inv_k,
+    eps,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    t = tl.program_id(0)
+    n = tl.arange(0, BLOCK_N)
+    mn = n < N
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    sqv = tl.zeros([BLOCK_S], dtype=tl.float32)
+    for s0 in range(0, S, BLOCK_S):
+        sv = s0 + tl.arange(0, BLOCK_S)
+        ms = sv < S
+        tile = tl.load(d_ptr + (sv[:, None] * T + t) * N + n[None, :], mask=ms[:, None] & mn[None, :], other=0.0)
+        acc += tl.sum(tile, axis=0)
+        sqv += tl.load(sq_ptr + sv * T + t, mask=ms, other=0.0)
+    r = 1.0 / tl.sqrt(tl.sum(sqv, axis=0) * inv_k + eps)
+    tl.store(out_ptr + t * N + n, acc * r, mask=mn)
+
+
+def _hc_prenorm_splits(num_tokens: int, k: int) -> int:
+    """Split-K factor of the DeepGEMM prenorm GEMM (sglang mhc._compute_num_split_for_mhc_pre)."""
+    block_m, block_k = 64, 64
+    grid = (num_tokens + block_m - 1) // block_m
+    n_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return max(1, min(n_sms // max(grid, 1), ((k + block_k - 1) // block_k) // 4))
+
+
+def hc_prenorm_mixes(x: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
+    """mixes = (x_flat @ hc_fn^T) * rsqrt(mean(x_flat^2) + eps) in fp32.
+
+    Production path (as sglang on SM100): DeepGEMM ``tf32_hc_prenorm_gemm`` (TF32
+    GEMM + row sum of squares, split-K) and a split reduction; falls back to the
+    fp32 reference when DeepGEMM is unavailable or MINISGL_DSV4_HC_GEMM=torch.
+    """
+    T = x.shape[0]
+    if T == 0 or _HC_GEMM_BACKEND == "torch" or x.dtype != torch.bfloat16 or hc_fn.shape[0] < 16:
+        return hc_prenorm_mixes_ref(x, hc_fn, eps)
+    from minisgl.kernel import deepgemm as dg
+
+    x_flat = x.reshape(T, -1)
+    K = x_flat.shape[1]
+    N = hc_fn.shape[0]
+    S = _hc_prenorm_splits(T, K)
+    d = torch.empty((S, T, N), dtype=torch.float32, device=x.device)
+    sq = torch.empty((S, T), dtype=torch.float32, device=x.device)
+    dg.tf32_hc_prenorm_gemm(x_flat, hc_fn, d, sq, S)
+    out = torch.empty((T, N), dtype=torch.float32, device=x.device)
+    _hc_mix_reduce_kernel[(T,)](
+        d, sq, out, T, S, 1.0 / K, float(eps), N=N, BLOCK_N=triton.next_power_of_2(N),
+        BLOCK_S=min(64, triton.next_power_of_2(S)), num_warps=2,
+    )
+    return out
+
+
+import os as _os
+
+_HC_GEMM_BACKEND = _os.environ.get("MINISGL_DSV4_HC_GEMM", "deepgemm").lower()
 
 
 # ---------------------------------------------------------------------------
