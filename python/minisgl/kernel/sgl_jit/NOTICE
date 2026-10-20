@@ -1,0 +1,16 @@
+Vendored from SGLang 0.5.18 (https://github.com/sgl-project/sglang), Apache License 2.0.
+
+  include/sgl_kernel/**                      sglang/kernels/jit/include/sgl_kernel (unchanged)
+  csrc/attention/kda_packed_decode.cuh       sglang/kernels/jit/csrc/attention (unchanged)
+  csrc/moe/route_radix.cuh                   sglang/kernels/jit/csrc/moe (unchanged)
+  csrc/kimi_k3/attn_res/fused_tma.cuh        sglang/kernels/jit/csrc/kimi_k3/attn_res (unchanged)
+  csrc/distributed/custom_all_reduce.cuh     sglang/kernels/jit/csrc/distributed (unchanged)
+  csrc/deepseek_v4/main_norm_rope.cuh        sglang/kernels/jit/csrc/deepseek_v4 (unchanged)
+  csrc/deepseek_v4/rope.cuh                  (unchanged)
+  csrc/deepseek_v4/topk_v2.cuh               (unchanged; itself adapted from vLLM / FlashInfer)
+  csrc/deepseek_v4/fp8_wo_a_group_major_quant.cuh (unchanged)
+
+The Python loader (__init__.py) is a minimal reimplementation of sglang's
+``load_jit`` wrapper generation (tvm-ffi exports, nvcc for the local GPU).
+The Triton kernels under ../sgl_triton carry their own provenance headers
+(sglang / vLLM / flash-linear-attention, Apache-2.0 / MIT).
