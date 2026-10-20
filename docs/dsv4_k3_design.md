@@ -34,7 +34,8 @@ wherever they exist outside compiled sglang binaries (details and timings in §9
 * Vendored sglang JIT CUDA kernels (`kernel/sgl_jit`, compiled with nvcc through
   tvm-ffi on first use, cached under `$MINISGL_JIT_CACHE_DIR`): KDA packed decode
   (B >= 8), radix router (K3), attention-residual TMA kernel (K3, SM100), DSV4
-  main-q norm+RoPE, indexer-q RoPE+Hadamard+FP8 quant, (inverse) RoPE, top-k v2
+  main-q norm+RoPE, indexer-q RoPE+Hadamard+FP8 quant, compressed indexer-key
+  norm+RoPE+Hadamard+FP8 store (fused_norm_rope_v2), (inverse) RoPE, top-k v2
   (fused top-512 + page-table transform) and the wo_a FP8 group quant.
 * Vendored sglang Triton kernels (`kernel/sgl_triton`): `causal_conv1d_update`, the
   KDA packed-decode fallback (B < 8), the sigmoid-gated RMSNorm and the fused MoE
@@ -43,8 +44,10 @@ wherever they exist outside compiled sglang binaries (details and timings in §9
   the FP8 grouped einsum for DSV4 `wo_a`, the TF32 split-K mHC prenorm GEMM and the
   paged FP8 MQA logits of the DSV4 indexer (keys FP8 + FP32 scale in 64-entry pages).
 * flashinfer 0.6.6: trtllm-gen MLA decode for K3 (paged BF16 latent, page 64; heads
-  zero-padded to a power of two) and trtllm-gen sparse MLA for DSV4 (BF16 rows,
-  per-head sinks; heads padded to 128 at large batch x top-k for the 2-CTA kernel).
+  zero-padded to a power of two) and trtllm-gen sparse MLA for DSV4 (FP8 e4m3 query
+  and KV rows with per-tensor scale 1 by default, BF16 with
+  `MINISGL_DSV4_KV_DTYPE=bf16`; per-head sinks; heads padded to 128 at large
+  batch x top-k for the 2-CTA kernel).
 * Own Triton where sglang's kernel is not usable here: the fused mHC pre (split-K
   reduction + Sinkhorn + weighted sum + RMSNorm, the shape of sglang's TileLang
   `mhc_pre_big_fuse_with_norm`), mHC post, the DSV4 compressors and the sparse-index
@@ -86,7 +89,8 @@ Each model gets its own pool + attention backend (selected by architecture);
 (`max_running_req + 1` slots, last one = dummy request for graph padding).
 
 * DSV4 (`page_size = 256`, as sglang: a page holds 64 C4 entries and 2 C128 entries):
-  - per layer one KV buffer `[slots, 576]` bf16 = SWA ring region `R x 128`
+  - per layer one KV buffer `[slots, 576]` (FP8 e4m3 by default, 576 B per row;
+    BF16 with `MINISGL_DSV4_KV_DTYPE=bf16`) = SWA ring region `R x 128`
     (slot = `R0 + table_idx*128 + pos % 128`) + scratch + compressed region
     (`token_slot // ratio`, i.e. N/4 or N/128 entries);
   - per C4 layer a paged indexer-key cache: per page 64 x 128 FP8 keys followed by
@@ -258,12 +262,12 @@ C128; K3: 69 KDA + 24 MLA).
 
 | model | TP | B | C=4K before / after | C=32K before / after |
 |---|---:|---:|---:|---:|
-| DSV4-Flash | 1 | 8 | 392 / 156 | 434 / 160 |
-| DSV4-Flash | 1 | 32 | 580 / 159 | 681 / 163 |
-| DSV4-Flash | 1 | 128 | 812 / 202 | 1184 / 213 |
-| DSV4-Flash | 2 | 8 | 409 / 156 | 450 / 161 |
-| DSV4-Flash | 2 | 32 | 596 / 171 | 703 / 179 |
-| DSV4-Flash | 2 | 128 | 817 / 214 | 1201 / 228 |
+| DSV4-Flash | 1 | 8 | 392 / 148 | 434 / 152 |
+| DSV4-Flash | 1 | 32 | 580 / 150 | 681 / 154 |
+| DSV4-Flash | 1 | 128 | 812 / 178 | 1184 / 190 |
+| DSV4-Flash | 2 | 8 | 409 / 151 | 450 / 155 |
+| DSV4-Flash | 2 | 32 | 596 / 161 | 703 / 169 |
+| DSV4-Flash | 2 | 128 | 817 / 194 | 1201 / 207 |
 | Kimi-K3 | 1 | 8 | 410 / 269 | 474 / 287 |
 | Kimi-K3 | 1 | 32 | 504 / 329 | 789 / 377 |
 | Kimi-K3 | 1 | 128 | 779 / 545 | 1762 / 730 |
@@ -278,18 +282,23 @@ FastAFD / sglang:
 
 | model | TP | B=8 (4K, 32K) | B=32 (4K, 32K) | B=128 (4K, 32K) |
 |---|---:|---|---|---|
-| DSV4-Flash | 1 | 27.1/27.3, 29.2/30.6 | 37.6/31.1, 45.3/36.7 | 70.7/37.3, 84.3/52.3 |
-| DSV4-Flash | 2 | 25.5/27.1, 27.6/30.5 | 34.7/31.2, 42.0/37.0 | 64.8/37.1, 79.5/52.1 |
+| DSV4-Flash | 1 | 22.8/27.3, 24.8/30.6 | 28.4/31.1, 34.5/36.7 | 44.3/37.3, 56.6/52.3 |
+| DSV4-Flash | 2 | 21.8/27.1, 23.2/30.5 | 25.7/31.2, 32.7/37.0 | 42.0/37.1, 55.4/52.1 |
 | Kimi-K3 | 1 | 28.6/30.7, 40.4/43.1 | 85.0/79.4, 131.2/140.8 | 286.0/264.0, 470.3/490.0 |
 | Kimi-K3 | 2 | 21.5/25.2, 33.7/37.0 | 53.0/53.3, 99.5/104.3 | 163.8/154.6, 349.3/348.3 |
 
 K3 is within 0.85-1.08x of sglang everywhere (per layer type: KDA 0.80-1.08x, MLA
-0.81-1.15x). DSV4 is at parity for B <= 8,
-1.1-1.2x at B=32 and 1.5-1.9x at B=128; the gap is the sparse MLA kernel:
-sglang runs FlashMLA's SM100 FP8 sparse decode (sgl_kernel, 584 B/token), which
-is a compiled op outside this environment; flashinfer 0.6.6's trtllm-gen sparse
-MLA on BF16 rows is used instead (with the query padded to 128 heads at large
-batch x top-k: 43 us vs 27 us for the C4 layer at B=128, C=32K). K3 MLA at TP1
+0.81-1.15x). DSV4 is 0.76-0.94x of sglang for B <= 32 and 1.06-1.19x at B=128.
+sglang's sparse MLA is FlashMLA's SM100 FP8 sparse decode (sgl_kernel, BF16 query,
+584 B/token with per-64 UE8M0 scales), a compiled op outside this environment;
+FastAFD runs flashinfer 0.6.6's trtllm-gen e4m3 sparse MLA on FP8 query + FP8 KV
+rows instead (per-tensor scales; C4 layer at B=128: 22-23 us vs FlashMLA 27 us,
+BF16 trtllm-gen 37-43 us). What remains at B=128 is the compressor decode (Triton
+here, sglang's JIT c4/c128 v2 kernels plan their state in pages) and the per-layer
+query cast and index assembly (2-3 us each). The FP8 query costs accuracy against
+BF16 attention (module rel-L2 3.5e-2 vs 5e-3 with dummy weights, full-forward
+logits 1.5e-2 vs 1.0e-2, argmax agreement 1.0); `MINISGL_DSV4_KV_DTYPE=bf16`
+restores the BF16 path. K3 MLA at TP1
 compares against sglang's CuTe-DSL MLA (flashinfer 0.6.17; sglang's trtllm-gen
 default rejects 96 heads); at TP2 the 48 heads are padded to 64 (flashinfer 0.6.17
 has a 48-head kernel) and MLA stays within 0.96-1.15x. The padded [q_abs | q_rope]
@@ -299,9 +308,9 @@ query is built in one Triton pass.
 
 | op | DSV4 | K3 |
 |---|---|---|
-| attention core | trtllm-gen sparse MLA (BF16; sglang: FlashMLA FP8) | KDA: causal_conv1d_update + KDA packed decode (CUDA, B>=8) + gated RMSNorm; MLA: trtllm-gen (page 64) |
+| attention core | trtllm-gen e4m3 sparse MLA, FP8 query + KV (sglang: FlashMLA FP8 KV, BF16 query) | KDA: causal_conv1d_update + KDA packed decode (CUDA, B>=8) + gated RMSNorm; MLA: trtllm-gen (page 64) |
 | indexer | q RoPE+Hadamard+FP8 (JIT), DeepGEMM paged FP8 MQA logits, top-k v2 (JIT) | - |
-| compressor | BF16->FP32 cuBLAS GEMM; Triton state update/store (sglang: JIT c4/c128 v2) | - |
+| compressor | BF16->FP32 cuBLAS GEMM; Triton state update + pooling and KV-row store (sglang: JIT c4/c128 v2); indexer keys: JIT fused_norm_rope_v2 | - |
 | projections | DeepGEMM FP8 (wq_a+wkv merged, wq_b, wo_b), FP8 grouped einsum wo_a | cuBLAS BF16, q/k/v/g and q_a/kv_a merged (sglang: TGV CuTe-DSL GEMM for m <= 8) |
 | residual mixing | mHC: DeepGEMM TF32 prenorm + fused Triton pre/norm (sglang: TileLang) | attention residuals: SM100 TMA kernel with fused RMSNorm |
 | router | BF16->FP32 GEMM + fused Triton router (sqrt-softplus) | merged front GEMM (router + latent down + shared gate_up, FP32 out) + radix router |
