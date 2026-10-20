@@ -137,6 +137,33 @@ def profiles(results_dir: str) -> str:
                    f"{g('dense_ms')} | {g('norm_ms')} | {g('gate_ms')} | {g('quant_ms')} | {g('moe_ms')} | {g('sample_ms')} | "
                    f"{g('copy_ms')} | {g('other_ms')} |")
     out.append("")
+    # colocated engine: per-step buckets from the labelled (eager) trace
+    bucket_files = [(f, json.load(open(f))) for f in files]
+    bucket_files = [(f, d) for f, d in bucket_files if d.get("median_by_bucket")]
+    if bucket_files:
+        order = ["attention_core", "attention_proj_allreduce", "gate", "routed_megamoe", "shared_expert",
+                 "mhc_norm_residual", "lm_head", "outside_layers"]
+        out += ["## Colocated per-step breakdown (ms per decode step, innermost model label of each kernel; "
+                "eager trace, kernel time only)", "",
+                "| file | step ms (unprofiled) | GPU busy | " + " | ".join(order) + " | other labels |",
+                "|---|---:|---:|" + "---:|" * (len(order) + 1)]
+        for f, d in bucket_files:
+            b = d["median_by_bucket"]
+            tot = lambda k: f"{b[k]['total']:.2f}" if k in b else "-"  # noqa: E731
+            other = sum(v["total"] for k, v in b.items() if k not in order)
+            out.append(f"| {os.path.basename(f)} | {d.get('step_ms_unprofiled') or '-'} | {d['median'].get('busy_ms', 0.0):.2f} | "
+                       + " | ".join(tot(k) for k in order) + f" | {other:.2f} |")
+        out.append("")
+        out.append("Bucket detail (kernel categories inside each bucket, ms per step):")
+        out.append("")
+        for f, d in bucket_files:
+            parts = []
+            for k in order:
+                if k in d["median_by_bucket"]:
+                    cats = ", ".join(f"{c} {v:.2f}" for c, v in sorted(d["median_by_bucket"][k].items(), key=lambda kv: -kv[1]) if c != "total" and v >= 0.005)
+                    parts.append(f"{k}: {cats}")
+            out.append(f"- {os.path.basename(f)}: " + "; ".join(parts))
+        out.append("")
     return "\n".join(out)
 
 

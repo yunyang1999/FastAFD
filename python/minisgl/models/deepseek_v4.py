@@ -35,7 +35,7 @@ from minisgl.layers import (
     VocabParallelEmbedding,
 )
 from minisgl.layers.linear import _LinearTPImpl
-from minisgl.utils import debug_taps, div_even, nvtx_annotate
+from minisgl.utils import debug_taps, div_even, nvtx_annotate, nvtx_range
 
 from .base import BaseLLMModel
 from .moe_common import (
@@ -134,6 +134,9 @@ _ROUTER_IMPL = os.environ.get("MINISGL_DSV4_ROUTER", "sglang").lower()
 _ATTN_ELEMWISE_IMPL = os.environ.get("MINISGL_DSV4_ATTN_ELEMWISE", "sglang").lower()
 _INDEX_STORE_IMPL = os.environ.get("MINISGL_DSV4_INDEX_STORE", "sglang").lower()  # sglang | triton
 _WO_A_FP8 = os.environ.get("MINISGL_DSV4_WO_A", "fp8").lower() == "fp8"
+# colocated MoE: run the shared expert on this rank's token shard inside the MegaMoE
+# executor (before its all-gather) instead of replicating it over all tokens on every rank
+_COLO_SHARED_SP = os.environ.get("MINISGL_DSV4_COLO_SHARED_SP", "0") == "1"
 
 
 def rope_table_len() -> int:
@@ -611,19 +614,21 @@ class DSV4Attention(BaseOP):
         comp = cnt = None
         comp_off = 0
         if self.ratio:
-            self.compressor.run(x, md, cos, sin, pool.state_kv[l], pool.state_score[l], layer_kv, pool.comp_base)
-            if self.ratio == 4:
-                comp, cnt = self.indexer.run(x, qr, md, cos, sin, pool, l)
-                if md.is_decode and md.c4_bt is not None:
-                    comp_off = pool.comp_base  # sglang top-k path returns rows relative to the c4 region
-            else:
-                comp, cnt = md.c128_idx, md.n128_valid
-        idx, seq_lens = backend.attn_index(md, comp, cnt, comp_off)
-        o = backend.sparse_attn(q, layer_kv, idx, self.attn_sink, self.head_dim**-0.5, seq_lens)
-        # persist this forward's window kv into the per-request ring
-        if md.ring_src.numel():
-            kvb = layer_kv.view(torch.uint8)  # byte rows: index ops do not take FP8
-            kvb.index_copy_(0, md.ring_dst, kvb.index_select(0, md.ring_src))
+            with nvtx_range("DSV4AttnIndex"):  # compressed KV + sparse index selection
+                self.compressor.run(x, md, cos, sin, pool.state_kv[l], pool.state_score[l], layer_kv, pool.comp_base)
+                if self.ratio == 4:
+                    comp, cnt = self.indexer.run(x, qr, md, cos, sin, pool, l)
+                    if md.is_decode and md.c4_bt is not None:
+                        comp_off = pool.comp_base  # sglang top-k path returns rows relative to the c4 region
+                else:
+                    comp, cnt = md.c128_idx, md.n128_valid
+        with nvtx_range("DSV4AttnCore"):
+            idx, seq_lens = backend.attn_index(md, comp, cnt, comp_off)
+            o = backend.sparse_attn(q, layer_kv, idx, self.attn_sink, self.head_dim**-0.5, seq_lens)
+            # persist this forward's window kv into the per-request ring
+            if md.ring_src.numel():
+                kvb = layer_kv.view(torch.uint8)  # byte rows: index ops do not take FP8
+                kvb.index_copy_(0, md.ring_dst, kvb.index_select(0, md.ring_src))
         if use_sgl:
             from minisgl.kernel.dsv4_sgl import freqs_real, fused_rope_inplace
 
@@ -631,16 +636,17 @@ class DSV4Attention(BaseOP):
         else:
             inverse_rope_(o, pos, cos, sin, self._rope_dim)
         o = o.reshape(T, self.n_groups_local, -1)
-        if self.wo_a_q is not None:
-            from minisgl.kernel.dsv4_sgl import wo_a_einsum, wo_a_weight_sf
+        with nvtx_range("DSV4AttnOut"):  # grouped wo_a, wo_b (+ TP all-reduce)
+            if self.wo_a_q is not None:
+                from minisgl.kernel.dsv4_sgl import wo_a_einsum, wo_a_weight_sf
 
-            if self._wo_a_sf is None:
-                self._wo_a_sf = wo_a_weight_sf(self.wo_a_q.weight_scale, self.n_groups_local, self.o_lora, self._in_g)
-            o = wo_a_einsum(o, self.wo_a_q.weight.view(self.n_groups_local, self.o_lora, -1), self._wo_a_sf)
-        else:
-            wo_a = self.wo_a.view(self.n_groups_local, self.o_lora, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
-        return self.wo_b.forward(o.flatten(1))
+                if self._wo_a_sf is None:
+                    self._wo_a_sf = wo_a_weight_sf(self.wo_a_q.weight_scale, self.n_groups_local, self.o_lora, self._in_g)
+                o = wo_a_einsum(o, self.wo_a_q.weight.view(self.n_groups_local, self.o_lora, -1), self._wo_a_sf)
+            else:
+                wo_a = self.wo_a.view(self.n_groups_local, self.o_lora, -1)
+                o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            return self.wo_b.forward(o.flatten(1))
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +675,7 @@ class DSV4Gate(BaseOP):
             self.bias = torch.empty(args.n_routed, dtype=torch.float32)
         self._topk = args.topk
 
+    @nvtx_annotate("DSV4Gate")
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (ids int32 [T,k], normalised weights fp32 [T,k]) without rsf.
 
@@ -700,6 +707,7 @@ class DSV4SharedExpert(BaseOP):
         self._inter = args.moe_inter
         self._limit = args.swiglu_limit
 
+    @nvtx_annotate("DSV4Shared")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.gate_up.forward(x)
         a = ActivationSpec("swiglu", clamp=self._limit)(h[:, : self._inter], h[:, self._inter :])
@@ -740,9 +748,14 @@ class DSV4MoE(BaseOP):
         if executor is not None:
             # colocated MegaMoE runs the routed experts; the shared expert runs
             # locally (the synthetic shared slot of the colocated kernel faults
-            # at EP=1, see docs/dsv4_k3_design.md)
-            y = executor(x, ids, w, self.experts.megamoe())
-            if self.shared_experts is not None:
+            # at EP=1, see docs/dsv4_k3_design.md): either on this rank's token
+            # shard inside the executor (MINISGL_DSV4_COLO_SHARED_SP=1, before the
+            # all-gather; replicated weights, same arithmetic, 1/EP of the FLOPs)
+            # or replicated over all tokens afterwards.
+            shared = self.shared_experts.forward if self.shared_experts is not None and _COLO_SHARED_SP else None
+            with nvtx_range("DSV4Routed"):
+                y = executor(x, ids, w, self.experts.megamoe(), shared=shared)
+            if self.shared_experts is not None and shared is None:
                 y = (y.float() + self.shared_experts.forward(x).float()).to(x.dtype)
             return y
         w13, w2 = self.experts.bf16()
@@ -923,7 +936,8 @@ class DeepseekV4ForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         ctx = get_global_ctx()
         h = self.model.forward(ctx.batch.input_ids, self._executor)
-        return self.lm_head.forward(h)
+        with nvtx_range("DSV4Head"):
+            return self.lm_head.forward(h)
 
 
 __all__ = ["DeepseekV4ForCausalLM", "DSV4Model", "DSV4Args", "DSV4TopK", "DSV4Residual"]

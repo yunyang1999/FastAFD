@@ -202,6 +202,22 @@ class Scheduler(SchedulerIOMixin):
         self._step_trace: list[tuple[int, str, int, int]] = []
         if self._step_trace_path:
             atexit.register(self._flush_step_trace)
+        # torch.profiler window over forward steps on the primary rank
+        # (MINISGL_SCHED_TORCH_PROFILE=<phase>:<first>:<count>[:<bs,...>], written to
+        # MINISGL_SCHED_TORCH_PROFILE_DIR or next to the step trace).
+        self._tprof = None
+        tprof_spec = os.environ.get("MINISGL_SCHED_TORCH_PROFILE", "").strip()
+        if tprof_spec and config.tp_info.is_primary():
+            from minisgl.utils.torch_profile import StepProfiler
+
+            tprof_dir = os.environ.get("MINISGL_SCHED_TORCH_PROFILE_DIR", "").strip() or (
+                os.path.dirname(os.path.abspath(self._step_trace_path))
+                if self._step_trace_path
+                else os.getcwd()
+            )
+            self._tprof = StepProfiler(
+                tprof_spec, tprof_dir, tag="sched", device=self.device, log=logger.info
+            )
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -381,9 +397,13 @@ class Scheduler(SchedulerIOMixin):
             )
             if len(self._step_trace) % 64 == 0:
                 self._flush_step_trace()
+        if self._tprof is not None:
+            self._tprof.begin(batch.phase, batch.size)
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if self._tprof is not None:
+            self._tprof.end()
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         if self._ray_nsys_enabled and not self._nsys_warmup_complete:
             self._nsys_warmup_complete = True

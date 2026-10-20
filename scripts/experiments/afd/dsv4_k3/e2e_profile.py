@@ -14,6 +14,16 @@ start to last kernel end), the busy time (union of kernel intervals) and the idl
 
   python e2e_profile.py --trace torch_profile_attention_dp0_rank0.json --role attention \
       --step-ms 20.5 --out profile_attention_b64.json [--keep-steps 2:]
+
+Colocated engine (``--role colo``): the scheduler writes ``torch_profile_sched[_bs<N>].json``
+(``MINISGL_SCHED_TORCH_PROFILE``, steps ``sched_step[<i>]`` each ended by a device
+synchronize), so kernels -- CUDA-graph replays included -- are attributed to steps by
+timestamp. With ``MINISGL_NVTX_TORCH_RECORD=1`` (eager run) the model's NVTX ranges are
+in the trace as well and every kernel is also attributed to its innermost label
+(DSV4AttnCore, DSV4AttnIndex, DSV4Attn, DSV4AttnOut, DSV4Gate, DSV4Routed, DSV4Shared,
+DSV4Layer_<l>, DSV4Head), which the output groups into the step buckets attention core /
+attention projections + all-reduce / gate / routed MegaMoE / shared expert / mHC+norms /
+lm_head / outside-layers (sampler, copies).
 """
 
 from __future__ import annotations
@@ -39,6 +49,26 @@ CATEGORIES = [  # first match wins
     ("copy", re.compile(r"Memcpy|memcpy|Memset|memset|copy_|elementwise|fill|index_|gather|scatter|cat_|"
                         r"vectorized|unrolled|reduce_kernel|where", re.I)),
 ]
+
+
+LABEL_PREFIXES = ("DSV4", "AFD_", "K3", "Kimi", "Layer_", "MHA")
+
+BUCKETS = [  # innermost model label -> step bucket (colocated DSV4)
+    ("attention_core", ("DSV4AttnCore", "DSV4AttnIndex")),
+    ("attention_proj_allreduce", ("DSV4Attn", "DSV4AttnOut")),
+    ("gate", ("DSV4Gate",)),
+    ("routed_megamoe", ("DSV4Routed",)),
+    ("shared_expert", ("DSV4Shared",)),
+    ("mhc_norm_residual", ("DSV4Layer",)),
+    ("lm_head", ("DSV4Head",)),
+]
+
+
+def bucket_of(label: str) -> str:
+    for b, labs in BUCKETS:
+        if label in labs:
+            return b
+    return "outside_layers" if label == "(none)" else f"other:{label}"
 
 
 def categorize(name: str) -> str:
@@ -69,6 +99,8 @@ def main() -> None:
     ap.add_argument("--step-ms", type=float, default=None, help="unprofiled step period at this batch (for idle vs T)")
     ap.add_argument("--keep-steps", default="1:", help="python slice of the profiled steps to average (drop the first)")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--attribute", choices=["auto", "corr", "ts"], default="auto",
+                    help="kernel->step attribution: launch correlation (AFD workers) or timestamp (synced sched steps)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     data = json.load(open(args.trace))
@@ -77,14 +109,21 @@ def main() -> None:
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
 
     steps = []  # (step_id, tid, ts, te)
+    labels = []  # (label, tid, ts, te) model NVTX ranges mirrored as record_function
     runtime = {}  # correlation -> (ts, tid)
     kernels = []
+    synced_steps = False
+    step_rx = re.compile(r"(afd|sched)_step\[(\d+)\]")
     for e in evs:
         cat = e.get("cat", "")
-        if cat == "user_annotation" or (cat == "cpu_op" and str(e.get("name", "")).startswith("afd_step[")):
-            m = re.match(r"afd_step\[(\d+)\]", str(e.get("name", "")))
+        name = str(e.get("name", ""))
+        if cat == "user_annotation" or (cat == "cpu_op" and (step_rx.match(name) or name.startswith(LABEL_PREFIXES))):
+            m = step_rx.match(name)
             if m:
-                steps.append((int(m.group(1)), e.get("tid"), e["ts"], e["ts"] + e.get("dur", 0)))
+                steps.append((int(m.group(2)), e.get("tid"), e["ts"], e["ts"] + e.get("dur", 0)))
+                synced_steps = synced_steps or m.group(1) == "sched"
+            elif name.startswith(LABEL_PREFIXES):
+                labels.append((re.sub(r"_\d+$", "", name), e.get("tid"), e["ts"], e["ts"] + e.get("dur", 0)))
         elif cat in ("cuda_runtime", "cuda_driver"):
             # the EG persistent MegaMoE kernel is launched through the driver API
             corr = e.get("args", {}).get("correlation")
@@ -93,9 +132,17 @@ def main() -> None:
         elif cat == "kernel":
             kernels.append(e)
     steps.sort(key=lambda s: s[2])
+    labels.sort(key=lambda l: l[3] - l[2])  # innermost (shortest) first
+    by_ts = args.attribute == "ts" or (args.attribute == "auto" and synced_steps)
 
-    def step_of(corr):
-        r = runtime.get(corr)
+    def step_of(k):
+        if by_ts:  # steps end with a device synchronize: the kernel lies inside its step
+            ts = k["ts"]
+            for sid, _, s0, s1 in steps:
+                if s0 <= ts <= s1:
+                    return sid
+            return None
+        r = runtime.get(k.get("args", {}).get("correlation"))
         if r is None:
             return None
         ts, tid = r
@@ -104,22 +151,36 @@ def main() -> None:
                 return sid
         return None
 
+    def label_of(k):
+        r = runtime.get(k.get("args", {}).get("correlation"))
+        if r is None:
+            return None
+        ts, tid = r
+        for lab, ltid, l0, l1 in labels:
+            if l0 <= ts <= l1 and (ltid == tid or ltid is None):
+                return lab
+        return None
+
     per_step: dict[int, dict] = {}
     unattributed = 0.0
     names: dict[str, list[float]] = {}
     for k in kernels:
-        sid = step_of(k.get("args", {}).get("correlation"))
+        sid = step_of(k)
         dur = k.get("dur", 0) / 1e3  # us -> ms
         name = k["name"]
         if sid is None:
             unattributed += dur
             continue
-        st = per_step.setdefault(sid, {"cats": {}, "intervals": [], "n_kernels": 0})
+        st = per_step.setdefault(sid, {"cats": {}, "intervals": [], "n_kernels": 0, "labels": {}})
         c = categorize(name)
         st["cats"][c] = st["cats"].get(c, 0.0) + dur
         st["intervals"].append((k["ts"] / 1e3, (k["ts"] + k.get("dur", 0)) / 1e3))
         st["n_kernels"] += 1
         names.setdefault(f"{c}|{name}", []).append(dur)
+        if labels:
+            lab = label_of(k) or "(none)"
+            lc = st["labels"].setdefault(lab, {})
+            lc[c] = lc.get(c, 0.0) + dur
 
     sids = sorted(per_step)
     sl = slice(*[int(x) if x else None for x in args.keep_steps.split(":")])
@@ -135,6 +196,26 @@ def main() -> None:
         rows.append(row)
     keys = sorted({k for r in rows for k in r if k != "step_id"})
     med = {k: statistics.median([r.get(k, 0.0) for r in rows]) for k in keys} if rows else {}
+    # per-label and per-bucket medians (ms per step, by kernel category)
+    label_med: dict[str, dict[str, float]] = {}
+    all_labels = sorted({lab for sid in kept for lab in per_step[sid]["labels"]})
+    for lab in all_labels:
+        cats = sorted({c for sid in kept for c in per_step[sid]["labels"].get(lab, {})})
+        label_med[lab] = {c: statistics.median([per_step[sid]["labels"].get(lab, {}).get(c, 0.0) for sid in kept]) for c in cats}
+        label_med[lab]["total"] = statistics.median([sum(per_step[sid]["labels"].get(lab, {}).values()) for sid in kept])
+    bucket_med: dict[str, dict[str, float]] = {}
+    if all_labels:
+        for sid in kept:
+            per_step[sid]["buckets"] = {}
+            for lab, cats in per_step[sid]["labels"].items():
+                b = bucket_of(lab)
+                bc = per_step[sid]["buckets"].setdefault(b, {})
+                for c, v in cats.items():
+                    bc[c] = bc.get(c, 0.0) + v
+        for b in sorted({b for sid in kept for b in per_step[sid]["buckets"]}):
+            cats = sorted({c for sid in kept for c in per_step[sid]["buckets"].get(b, {})})
+            bucket_med[b] = {c: statistics.median([per_step[sid]["buckets"].get(b, {}).get(c, 0.0) for sid in kept]) for c in cats}
+            bucket_med[b]["total"] = statistics.median([sum(per_step[sid]["buckets"].get(b, {}).values()) for sid in kept])
     top = sorted(((sum(v) / max(1, len(kept)), k, len(v)) for k, v in names.items()), reverse=True)[: args.top]
     out = {
         "schema": "fastafd.e2e-profile.v1",
@@ -146,6 +227,9 @@ def main() -> None:
         "median": med,
         "per_step": rows,
         "unattributed_kernel_ms_total": unattributed,
+        "attribution": "timestamp" if by_ts else "correlation",
+        "median_by_label": label_med,
+        "median_by_bucket": bucket_med,
         "top_kernels_ms_per_step": [{"category": k.split("|")[0], "name": k.split("|", 1)[1][:120],
                                      "ms_per_step": round(v, 4), "calls": n} for v, k, n in top],
     }

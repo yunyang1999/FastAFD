@@ -289,8 +289,11 @@ class ColocatedMegaMoE:
             w = torch.cat([w, sw], 1)
         return pid.contiguous(), w.contiguous()
 
-    def run_local(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, mega_weights) -> torch.Tensor:
-        """x [n<=max_tokens, hidden]: dispatch + experts + combine (collective over EP)."""
+    def run_local(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, mega_weights, shared=None) -> torch.Tensor:
+        """x [n<=max_tokens, hidden]: dispatch + experts + combine (collective over EP).
+
+        ``shared(x)`` (optional, replicated weights) is added to the routed output of
+        this rank's tokens -- one bf16 add, the same rounding as a float add + cast."""
         from minisgl.kernel import deepgemm as dg
         from minisgl.kernel.megamoe_mega import fp8_fp4_mega_moe
 
@@ -308,12 +311,14 @@ class ColocatedMegaMoE:
         fp8_fp4_mega_moe(y, mega_weights[0], mega_weights[1], self.buf, activation_clamp=self.clamp)
         if self.rsf != 1.0:
             y = y * self.rsf
+        if shared is not None and n > 0:
+            y.add_(shared(x[:n]).to(y.dtype))
         return y
 
-    def __call__(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, mega_weights) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor, mega_weights, shared=None) -> torch.Tensor:
         """x is replicated across the TP group: split tokens (SP), run, all-gather."""
         if self.ep_size == 1:
-            return self.run_local(x, ids, w, mega_weights)
+            return self.run_local(x, ids, w, mega_weights, shared)
         from minisgl.distributed import DistributedCommunicator
 
         T = int(x.shape[0])
@@ -324,7 +329,7 @@ class ColocatedMegaMoE:
             ids = torch.cat([ids, ids.new_zeros(pad, ids.shape[1])])
             w = torch.cat([w, w.new_zeros(pad, w.shape[1])])
         sl = slice(self.rank * per, (self.rank + 1) * per)
-        y_local = self.run_local(x[sl], ids[sl], w[sl], mega_weights)
+        y_local = self.run_local(x[sl], ids[sl], w[sl], mega_weights, shared)
         y = DistributedCommunicator().all_gather(y_local.contiguous())
         return y[:T]
 

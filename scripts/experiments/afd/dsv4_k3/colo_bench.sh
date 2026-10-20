@@ -6,7 +6,8 @@
 # Optional env: MODEL_KEY (deepseek_v4_flash), WEIGHTS (real; dummy adds --dummy-weight),
 #   TP (4), ISL (4096), OSL (1024), MAX_TOKENS (64), PROMPT_LEN (ISL + OSL/2 - MAX_TOKENS/2),
 #   BATCH_SIZES (8,16,32,64,128,192,256), PROMPT_FILE (real prompts; synthetic otherwise),
-#   MEMORY_RATIO (0.85), EXTRA_SERVER_ARGS, COMMIT, WAIT_READY_TIMEOUT (3600)
+#   MEMORY_RATIO (0.85), EXTRA_SERVER_ARGS, COMMIT, WAIT_READY_TIMEOUT (3600), GRAPH_BS,
+#   MINISGL_SCHED_TORCH_PROFILE (torch.profiler window, see minisgl/utils/torch_profile.py)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
@@ -28,7 +29,9 @@ esac
 MAX_BS=$(python -c "print(max(int(x) for x in '$BATCH_SIZES'.split(',')))")
 MAX_RUN=$(( MAX_BS * TP ))
 MAX_SEQ=$(( (PROMPT_LEN + MAX_TOKENS + 64 + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE ))
-GRAPH_BS=$(python -c "print(','.join(str(int(b) * $TP) for b in '$BATCH_SIZES'.split(',')))")
+# CUDA graphs for every swept batch (requests = batch per GPU x TP); GRAPH_BS overrides
+# (e.g. GRAPH_BS=4 runs the swept batches eagerly for a labelled torch.profiler trace)
+GRAPH_BS="${GRAPH_BS:-$(python -c "print(','.join(str(int(b) * $TP) for b in '$BATCH_SIZES'.split(',')))")}"
 EXTRA="${EXTRA_SERVER_ARGS:-}"
 [[ "$WEIGHTS" == "dummy" ]] && EXTRA="$EXTRA --dummy-weight"
 export MINISGL_SCHED_STEP_TRACE="$RUN_DIR/sched_trace.json"

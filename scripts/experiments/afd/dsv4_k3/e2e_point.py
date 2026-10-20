@@ -264,7 +264,11 @@ def main() -> None:
         dep_key = f"colo_tp{args.tp}" + (f"_ep{ep}" if args.ep else "")
         deployment = {"kind": "colocated", "software": args.software, "label": label, "tp": args.tp, "ep": ep,
                       "gpus": gpus, "nodes": args.nodes or 1}
-    sampling = "greedy" if float(sweep.get("temperature", 1.0)) == 0 else f"temperature {sweep.get('temperature', 1.0)}"
+    temp = sweep.get("temperature", 1.0)
+    try:
+        sampling = "greedy" if float(temp) == 0 else f"temperature {temp}"
+    except (TypeError, ValueError):
+        sampling = str(temp)
     prompts = args.prompts or ("real text (prompt file)" if sweep.get("prompt_file") else "synthetic repeated token")
     written = []
     for p in points:
