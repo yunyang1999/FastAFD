@@ -7,6 +7,9 @@
 #   AFD_ATTN_DP_SIZE  attention workers (A), AFD_MLP_DP_SIZE expert workers (F)
 #   RUN_DIR           output dir
 # Optional env:
+#   AFD_ATTN_TP_SIZE (attention TP per DP group, default 1; AFD_ATTN_DP_SIZE then
+#   counts DP groups and the attention GPUs are DP*TP), SWEEP_PROMPT_FILE (real
+#   text prompts for the sweep, one per line, distinct per request),
 #   BATCH_SIZES (per attention GPU, default 8,16,32,64), PROMPT_LEN (1024),
 #   MAX_TOKENS (64), AFD_NUM_MB (2), AFD_DECODE_GRAPH_BS (per-MB buckets),
 #   MEMORY_RATIO (0.85), MAX_SEQ_LEN (PROMPT_LEN+MAX_TOKENS+64), DUMMY_WEIGHT (1),
@@ -30,18 +33,21 @@ MEMORY_RATIO="${MEMORY_RATIO:-0.85}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-$((PROMPT_LEN + MAX_TOKENS + 64))}"
 DUMMY_WEIGHT="${DUMMY_WEIGHT:-1}"
 AFD_MAX_BATCHED_TOKENS="${AFD_MAX_BATCHED_TOKENS:-2048}"  # also the MegaMoE dispatch bucket
+AFD_ATTN_TP_SIZE="${AFD_ATTN_TP_SIZE:-1}"
+ATTN_GPUS=$(( AFD_ATTN_DP_SIZE * AFD_ATTN_TP_SIZE ))
 RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 PORT="${PORT:-$((20000 + RANDOM % 20000))}"
 
+# batch sizes are per attention GPU; a TP group of TP GPUs serves TP*b requests
 MAX_BS=$(python -c "print(max(int(x) for x in '$BATCH_SIZES'.split(',')))")
-PER_MB=$(( (MAX_BS + AFD_NUM_MB - 1) / AFD_NUM_MB ))
+PER_MB=$(( (MAX_BS * AFD_ATTN_TP_SIZE + AFD_NUM_MB - 1) / AFD_NUM_MB ))
 if [[ -z "${AFD_DECODE_GRAPH_BS:-}" ]]; then
   AFD_DECODE_GRAPH_BS=$(python -c "
-bs=[int(x) for x in '$BATCH_SIZES'.split(',')]; mb=$AFD_NUM_MB
+bs=[int(x) * $AFD_ATTN_TP_SIZE for x in '$BATCH_SIZES'.split(',')]; mb=$AFD_NUM_MB
 print(','.join(str(v) for v in sorted({max(1,(b+mb-1)//mb) for b in bs})))")
 fi
 # --afd-max-running-requests is global (split evenly over the attention DP ranks)
-NUM_REQ_TOTAL=$(( MAX_BS * AFD_ATTN_DP_SIZE ))
+NUM_REQ_TOTAL=$(( MAX_BS * ATTN_GPUS ))
 MAX_RUNNING=$NUM_REQ_TOTAL
 
 ARCH=$(python -c "import json;c=json.load(open('$MODEL_PATH/config.json'));print(c.get('model_type',''))")
@@ -63,12 +69,15 @@ ray.init(address="$RAY_ADDRESS", logging_level="ERROR")
 nodes = sorted({n["NodeManagerAddress"] for n in ray.nodes()
                 if n.get("Alive") and float(n.get("Resources", {}).get("GPU", 0)) > 0})
 gpn = int(${AFD_GPUS_PER_NODE:-4})
+tp = int($AFD_ATTN_TP_SIZE)
 slots = [ip for ip in nodes for _ in range(gpn)]
 A, F = int($AFD_ATTN_DP_SIZE), int($AFD_MLP_DP_SIZE)
-if len(slots) < A + F:
-    raise SystemExit(f"need {A + F} GPUs, Ray has {len(slots)} on {nodes}")
-print("export MINISGL_AFD_ATTN_NODES=" + ",".join(slots[:A]))
-print("export MINISGL_AFD_MLP_NODES=" + ",".join(slots[A:A + F]))
+if len(slots) < A * tp + F:
+    raise SystemExit(f"need {A * tp + F} GPUs, Ray has {len(slots)} on {nodes}")
+# one node entry per attention DP group (its TP ranks share the node)
+attn_groups = [slots[i * tp] for i in range(A)]
+print("export MINISGL_AFD_ATTN_NODES=" + ",".join(attn_groups))
+print("export MINISGL_AFD_MLP_NODES=" + ",".join(slots[A * tp:A * tp + F]))
 PY
 )"
 fi
@@ -83,7 +92,7 @@ EXTRA="--attention-backend $ATTN_BACKEND --memory-ratio $MEMORY_RATIO"
 [[ "$DUMMY_WEIGHT" == "1" ]] && EXTRA="$EXTRA --dummy-weight"
 EXTRA="$EXTRA ${EXTRA_SERVER_ARGS:-}"
 
-echo "AFD hybrid bench: model=$MODEL_PATH arch=$ARCH A=$AFD_ATTN_DP_SIZE F=$AFD_MLP_DP_SIZE mb=$AFD_NUM_MB"
+echo "AFD hybrid bench: model=$MODEL_PATH arch=$ARCH A=$AFD_ATTN_DP_SIZE x TP$AFD_ATTN_TP_SIZE F=$AFD_MLP_DP_SIZE mb=$AFD_NUM_MB"
 echo "  batch_sizes=$BATCH_SIZES graph_bs=$AFD_DECODE_GRAPH_BS prompt=$PROMPT_LEN max_tokens=$MAX_TOKENS"
 
 bash "$REPO_ROOT/scripts/kill_afd_ray_tasks.sh" >/dev/null 2>&1 || true  # leftovers of an earlier case
@@ -92,7 +101,7 @@ RAY_DEDUP_LOGS=0 "$REPO_ROOT/scripts/serve/fastafd_server.sh" \
   --launch-backend ray --ray-address "$RAY_ADDRESS" \
   --ray-log-dir "$RUN_DIR/ray_logs" --afd-report-dir "$RUN_DIR/ray_logs" \
   --afd-attn-dp-size "$AFD_ATTN_DP_SIZE" --afd-mlp-dp-size "$AFD_MLP_DP_SIZE" \
-  --afd-attn-tp-size 1 --afd-mlp-tp-size 1 --afd-mlp-ep-size "$AFD_MLP_DP_SIZE" \
+  --afd-attn-tp-size "$AFD_ATTN_TP_SIZE" --afd-mlp-tp-size 1 --afd-mlp-ep-size "$AFD_MLP_DP_SIZE" \
   --afd-batch-size "$NUM_REQ_TOTAL" --afd-max-running-requests "$MAX_RUNNING" \
   --afd-max-new-tokens "$MAX_TOKENS" --afd-max-batched-tokens "$AFD_MAX_BATCHED_TOKENS" \
   --cache-type naive --page-size "$PAGE_SIZE" --cuda-graph-max-bs "$PER_MB" \
@@ -105,7 +114,7 @@ cleanup_ray_workers() {  # hung workers of a killed server keep their GPUs other
 }
 stop_server() {
   kill -TERM "$SERVER_PID" 2>/dev/null || true
-  for _ in $(seq 1 30); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
+  for _ in $(seq 1 60); do kill -0 "$SERVER_PID" 2>/dev/null || return 0; sleep 2; done
   kill -KILL "$SERVER_PID" 2>/dev/null || true
   cleanup_ray_workers
 }
@@ -156,8 +165,9 @@ if [[ -n "${PROMPT_FILE:-}" ]]; then  # real text prompts (routing capture / san
 fi
 
 python "$SCRIPT_DIR/bench_client.py" --url "http://127.0.0.1:$PORT" \
-  --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --attn-dp "$AFD_ATTN_DP_SIZE" \
+  --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --attn-gpus "$ATTN_GPUS" \
   --batch-sizes "$BATCH_SIZES" --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" \
+  ${SWEEP_PROMPT_FILE:+--prompt-file "$SWEEP_PROMPT_FILE"} \
   --timeout "${CLIENT_TIMEOUT:-1800}" --out "$RUN_DIR/sweep.json" > "$RUN_DIR/client.log" 2>&1 &
 CLIENT_PID=$!
 # a worker whose hot loop died never answers; stop waiting on the client then

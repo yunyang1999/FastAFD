@@ -39,11 +39,16 @@ def main():
     sweep = json.load(open(args.sweep))
     paths = sorted(glob.glob(args.trace))
     source = "coordinator"
+    reqs_by_step: dict[int, int] = {}
     if paths:
+        all_events = load_events(paths)
         events = [
-            e for e in load_events(paths)
+            e for e in all_events
             if str(e.get("name", "")).startswith("AFD_Coordinator_ScheduleDps")
         ]
+        for e in all_events:
+            if str(e.get("name", "")).startswith("AFD_Coordinator_BuildDpLaunches") and "reqs" in e.get("fields", {}):
+                reqs_by_step[int(e["fields"]["step"])] = int(e["fields"]["reqs"])
     else:
         # Fallback: one attention worker's per-step materialize events. Prefill
         # is scheduled first, so the last (max_tokens - 1) steps of each batch
@@ -62,17 +67,29 @@ def main():
             dec = [e for e in win if e.get("fields", {}).get("phase") == "decode"]
         else:
             dec = win[-max(1, int(sweep.get("max_tokens", 2)) - 1):]
+        if reqs_by_step and dec:
+            # full-batch steps only (steps whose real request count is the window's
+            # maximum; ramp-up / drain steps run smaller batches)
+            full = max(reqs_by_step.get(int(e["fields"].get("step", -1)), 0) for e in dec)
+            dec = [e for e in dec if reqs_by_step.get(int(e["fields"].get("step", -1)), full) == full]
         starts = [e["start_time_ns"] for e in dec]
         deltas = [(b - a) / 1e6 for a, b in zip(starts, starts[1:])]
         core = deltas[args.skip : len(deltas) - args.skip] if len(deltas) > 2 * args.skip + 2 else deltas
+        srt = sorted(core)
+        pct = (lambda q: srt[min(len(srt) - 1, int(round(q * (len(srt) - 1))))]) if srt else (lambda q: None)
         row = {
             "per_attn_gpu_bs": run["per_attn_gpu_bs"],
             "num_requests": run["num_requests"],
             "decode_steps": len(starts),
             "step_ms_median": statistics.median(core) if core else None,
             "step_ms_mean": statistics.fmean(core) if core else None,
+            "step_ms_p50": pct(0.5),
+            "step_ms_p90": pct(0.9),
             "step_ms_min": min(core) if core else None,
             "step_ms_max": max(core) if core else None,
+            "step_ms_all": [round(x, 4) for x in deltas],
+            "reqs_per_step": (max(reqs_by_step.get(int(e["fields"].get("step", -1)), 0) for e in dec)
+                              if reqs_by_step and dec else None),
             "samples": len(core),
             "source": source,
         }
