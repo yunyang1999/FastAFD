@@ -601,6 +601,7 @@ class AfdAgDecodeGraphRunner:
         engine_stream.synchronize()
         for stream in lane_streams:
             stream.synchronize()
+        free_pre, _ = torch.cuda.mem_get_info(self.device)
         graph, self._pool = capture_cuda_graph(
             device=self.device,
             engine_stream=engine_stream,
@@ -611,11 +612,13 @@ class AfdAgDecodeGraphRunner:
             fn=_fn,
         )
         self.graphs[total] = _AgGraphBuf(graph=graph, capture_batch=whole, sub_batches=subs)
+        free_b, _ = torch.cuda.mem_get_info(self.device)
         log_line(
             self.log_path,
             f"[{self.label}] afd_ag_decode_graph mb warmup:done total={total} "
             f"mb_bs={mb_bs} pipeline_mb=1 schedule=paper_pipeline "
-            f"lanes={len(lane_streams)}",
+            f"lanes={len(lane_streams)} free_gib={free_pre / (1 << 30):.2f}->{free_b / (1 << 30):.2f} "
+            f"reserved_gib={torch.cuda.memory_reserved(self.device) / (1 << 30):.2f}",
             flush=True,
         )
 

@@ -28,6 +28,7 @@ _NODE_SCOPED_CACHE_ENV_KEYS = (
     "MINISGL_DEEPGEMM_BUILD_DIR",
 )
 
+_RUNTIME_ENV_PREFIXES = ("MINISGL_DSV4_", "MINISGL_K3_")
 _RUNTIME_ENV_KEYS = (
     "CONDA_PREFIX",
     "CONDA_DEFAULT_ENV",
@@ -273,6 +274,10 @@ def runtime_env(
     for key in _RUNTIME_ENV_KEYS:
         value = os.environ.get(key)
         if value:
+            env_vars[key] = value
+    # model kernel / cache knobs (MINISGL_DSV4_*, MINISGL_K3_*) are read inside the workers
+    for key, value in os.environ.items():
+        if key.startswith(_RUNTIME_ENV_PREFIXES) and value:
             env_vars[key] = value
     if node_scoped_cache:
         if not node_ip:
