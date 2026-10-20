@@ -102,7 +102,7 @@ def build_engine(path: str, rank: int, tp: int, max_bs: int, ctx: int):
 
     mc = ModelConfig.from_hf(cached_load_hf_config(path))
     P = model_attention_backend(mc)[1]
-    pages = max_bs * ((ctx + 2 + P - 1) // P) + 8
+    pages = max_bs * ((ctx + 64 + P) // P) + 8
     cfg = SchedulerConfig(
         model_path=path,
         tp_info=DistributedInfo(rank, tp),
@@ -121,33 +121,37 @@ def build_engine(path: str, rank: int, tp: int, max_bs: int, ctx: int):
     return Engine(cfg)
 
 
-def make_decode_batch(eng, B: int, C: int):
+def make_decode_batch(eng, B: int, C: int, spread: bool = False):
     """B requests at context C (token C is decoded); pages of request i are
-    contiguous so compressed groups never straddle pages."""
+    contiguous so compressed groups never straddle pages. ``spread`` puts
+    request r at C - 64 + (37 r mod 128) (mix of compressor boundaries, as the
+    sglang kernel benchmark)."""
     from minisgl.core import Batch, Req, SamplingParams
 
     P = eng.ctx.page_size
-    L = C + 1
-    np_ = (L + P - 1) // P
     dev = eng.device
     pt = eng.page_table
-    reqs = []
+    reqs, pos = [], []
+    np_ = (C + 64 + P) // P
     for i in range(B):
+        c = C - 64 + (37 * i) % 128 if spread else C
+        L = c + 1
         base = i * np_ * P
         pt[i, :L] = torch.arange(base, base + L, dtype=torch.int32, device=dev)
         reqs.append(
             Req(
                 input_ids=torch.zeros(L, dtype=torch.int32),
-                table_idx=i, cached_len=C, output_len=1, uid=i,
+                table_idx=i, cached_len=c, output_len=1, uid=i,
                 sampling_params=SamplingParams(), cache_handle=None,  # type: ignore[arg-type]
             )
         )
+        pos.append(c)
     batch = Batch(reqs=reqs, phase="decode")
     batch.padded_reqs = list(reqs)
     g = torch.Generator().manual_seed(B)
     V = int(eng.model._config.vocab_size)
     batch.input_ids = torch.randint(0, V, (B,), generator=g, dtype=torch.int32).to(dev)
-    batch.positions = torch.full((B,), C, dtype=torch.int32, device=dev)
+    batch.positions = torch.tensor(pos, dtype=torch.int32, device=dev)
     batch.out_loc = pt[torch.arange(B, device=dev), batch.positions.long()]
     return batch
 
@@ -242,12 +246,131 @@ def k3_fns(model, ids: list[int], B: int, dev, nb: int):
             res = K3Residual(buf=buf, nb=nb, prefix=h0 + h0)
             h, res = L.attention_part(res)
             moe = L.block_sparse_moe
-            moe.gate.forward(h)
-            moe.routed_expert_down_proj.forward(h)
-            sh = moe.shared_experts.forward(h) if moe.shared_experts is not None else None
+            _, _, _, sh = moe.front(h)  # router + latent down-projection + shared experts
             moe.post_combine(y_lat, sh)
 
     return attn, aside
+
+
+# ---------------------------------------------------------------------------
+# attention core only (boundary of the sglang attention-kernel benchmark):
+# DSV4: compressor(s) + indexer q prep / logits / top-k + sparse MLA (no
+# projection GEMMs, no main q/k norm+RoPE, no inverse RoPE); K3 KDA: conv update
+# + recurrent decode + gated norm; K3 MLA: the MLA decode kernel.
+# ---------------------------------------------------------------------------
+
+
+def dsv4_core_fns(model, ids: list[int], B: int, dev):
+    from minisgl.core import get_global_ctx
+    from minisgl.kernel.dsv4_triton import compressor_decode_step
+    from minisgl.models.deepseek_v4 import hadamard_matrix, layer_rope, linear_bf16_fp32
+
+    ctx = get_global_ctx()
+    backend = ctx.attn_backend
+    pool = backend.pool
+    md = ctx.batch.attn_metadata
+    pos = ctx.batch.positions
+    a = model.model._args
+    layers = [model.model.layers.op_list[i].attn for i in ids]
+    x = torch.randn(B, a.dim, device=dev, dtype=torch.bfloat16)
+    qr = torch.randn(B, a.q_lora_rank, device=dev, dtype=torch.bfloat16)
+    q = torch.randn(B, layers[0].n_local, a.head_dim, device=dev, dtype=torch.bfloat16)
+    pre = []
+    for at in layers:
+        c = at.compressor
+        kvsc = linear_bf16_fp32(x, c._w_kv_gate) if c is not None else None
+        ix = at.indexer
+        ikvsc = linear_bf16_fp32(x, ix.compressor._w_kv_gate) if ix is not None else None
+        iq = ix.wq_b.forward(qr).view(B, ix.n_heads, ix.head_dim) if ix is not None else None
+        iw = ix.weights_proj.forward(x) if ix is not None else None
+        pre.append((kvsc, ikvsc, iq, iw))
+
+    def comp_step(c, kvsc, state_kv, state_sc, out_buf, row_base, cos, sin):
+        n = c._n_kv
+        pooled = compressor_decode_step(kvsc[:, :n], kvsc[:, n:], c.ape, pos, md.tok_table, state_kv, state_sc,
+                                        ratio=c.ratio, overlap=c.overlap, head_dim=c.head_dim)
+        rows = md.comp_write[c.ratio]
+        rows = torch.where(rows >= 0, rows + row_base, rows)
+        had = hadamard_matrix(c.head_dim, str(dev)) if c.rotate else None
+        c._store(pooled, md.group_start[c.ratio], cos, sin, out_buf, rows, 2 if c.rotate else 1, had)
+
+    def core(sparse_only: bool = False, indexer_only: bool = False):
+        def fn():
+            for at, (kvsc, ikvsc, iq, iw) in zip(layers, pre):
+                l = at.layer_id
+                cos, sin = layer_rope(a, at.ratio, dev)
+                layer_kv = pool.kv[l]
+                comp = cnt = None
+                if at.ratio and not sparse_only:
+                    comp_step(at.compressor, kvsc, pool.state_kv[l], pool.state_score[l], layer_kv, pool.comp_base, cos, sin)
+                if at.ratio == 4:
+                    ix = at.indexer
+                    if not sparse_only:
+                        comp_step(ix.compressor, ikvsc, pool.idx_state_kv[l], pool.idx_state_score[l], pool.idx_keys[l], 0, cos, sin)
+                    comp, cnt = _indexer_select(ix, iq, iw, md, cos, sin, pool, l, B)
+                    if indexer_only:
+                        continue
+                elif at.ratio == 128:
+                    comp, cnt = md.c128_idx, md.n128_valid
+                idx, sl = backend.attn_index(md, comp, cnt)
+                backend.sparse_attn(q, layer_kv, idx, at.attn_sink, a.head_dim**-0.5, sl)
+
+        return fn
+
+    return core(), core(sparse_only=True), core(indexer_only=True)
+
+
+def _indexer_select(ix, iq, iw, md, cos, sin, pool, l, B):
+    from minisgl.core import get_global_ctx
+    from minisgl.kernel.dsv4_sgl import fused_q_indexer_quant, freqs_real, paged_mqa_logits, topk_transform_v2
+
+    pos = get_global_ctx().batch.positions
+    q_fp8, w_out = fused_q_indexer_quant(iq, iw, ix._scale, freqs_real(cos, sin), pos)
+    logits = paged_mqa_logits(q_fp8, pool.idx_keys[l], w_out.view(B, ix.n_heads), md.n4_valid, md.c4_bt, md.dg_sched,
+                              get_global_ctx().attn_backend.max_c4_len)
+    out = torch.empty((B, ix.topk), dtype=torch.int32, device=iq.device)
+    topk_transform_v2(logits, md.n4_valid, md.c4_bt, out, 64, md.topk_plan)
+    return torch.where(out >= 0, out + pool.comp_base, -1), torch.clamp(md.n4_valid, max=ix.topk)
+
+
+def k3_core_fns(model, ids: list[int], B: int, dev):
+    from minisgl.core import get_global_ctx
+    from minisgl.kernel.sgl_triton.causal_conv1d import causal_conv1d_update
+    from minisgl.kernel.sgl_triton.kda_decode import fused_recurrent_kda_packed_decode, layer_norm_gated_fwd
+
+    ctx = get_global_ctx()
+    backend = ctx.attn_backend
+    md = ctx.batch.attn_metadata
+    layers = [model.model.layers.op_list[i].self_attn for i in ids]
+    if model.model.layers.op_list[ids[0]].is_kda:
+        H, D = layers[0].h_local, layers[0]._D
+        qkv = torch.randn(B, 3 * H * D, device=dev, dtype=torch.bfloat16)
+        g_raw = torch.randn(B, H * D, device=dev, dtype=torch.bfloat16)
+        b_raw = torch.randn(B, H, device=dev, dtype=torch.bfloat16)
+        gate = torch.randn(B, H * D, device=dev, dtype=torch.bfloat16)
+
+        def kda():
+            for at in layers:
+                ssm, conv = backend.pool.kda_state(at.layer_id)
+                y = causal_conv1d_update(qkv, conv.transpose(-1, -2), at.conv_weight, None, activation="silu",
+                                         conv_state_indices=md.state_idx)
+                o = torch.empty((B, 1, H, D), dtype=torch.bfloat16, device=dev)
+                fused_recurrent_kda_packed_decode(mixed_qkv=y, a=g_raw, b=b_raw, A_log=at.A_log, dt_bias=at.dt_bias,
+                                                  scale=D**-0.5, initial_state=ssm, out=o, ssm_state_indices=md.state_idx,
+                                                  use_qk_l2norm_in_kernel=True, lower_bound=at._lb)
+                layer_norm_gated_fwd(o.view(B * H, D), gate.view(B * H, D), at.o_norm.weight, None,
+                                     activation="sigmoid", eps=at._eps, is_rms_norm=True)
+
+        return kda, None, None
+    H = layers[0].h_local
+    q_abs = torch.randn(B, H, 512, device=dev, dtype=torch.bfloat16)
+    q_rope = torch.randn(B, H, 64, device=dev, dtype=torch.bfloat16)
+
+    def mla():
+        for at in layers:
+            backend.mla_attn(at.layer_id, q_abs, q_rope)
+
+    return mla, None, None
 
 
 def run_rank(rank: int, args) -> list[dict] | None:
@@ -265,12 +388,24 @@ def run_rank(rank: int, args) -> list[dict] | None:
     mix = full_layer_mix(args.model)
     rows = []
     for B in bss:
-        batch = make_decode_batch(eng, B, args.ctx)
+        batch = make_decode_batch(eng, B, args.ctx, spread=args.core or args.spread)
         backend.init_capture_graph(args.ctx + 64, [B])
         backend.prepare_for_capture(batch)
         with eng.ctx.forward_batch(batch):
             per_type = {}
             for t, lids in ids.items():
+                if args.core:
+                    fns = (k3_core_fns if is_k3 else dsv4_core_fns)(model, lids, B, dev)
+                    n = len(lids)
+                    rec = {}
+                    for name, fn in zip(("core_us", "sparse_mla_us", "indexer_us"), fns):
+                        if fn is None or (name != "core_us" and t != "c4" and name == "indexer_us"):
+                            continue
+                        tt, cv = time_graph(fn, args.warmup, args.iters, args.trials)
+                        rec[name] = tt / n
+                        rec["cv_" + name] = cv
+                    per_type[t] = rec
+                    continue
                 if is_k3:
                     attn, aside = k3_fns(model, lids, B, dev, nb)
                 else:
@@ -283,6 +418,16 @@ def run_rank(rank: int, args) -> list[dict] | None:
                 n = len(lids)
                 per_type[t] = {"attn_us": ta / n, "aside_us": tb / n, "cv_attn": cva, "cv_aside": cvb}
         if args.profile:
+            continue
+        if args.core:
+            row = {"model": args.model, "tp": args.tp, "rank": rank, "bs": B, "ctx": args.ctx, "mode": "core",
+                   "impl": os.environ.get("MINISGL_ASIDE_IMPL_TAG", "minisgl"), "per_type": per_type}
+            rows.append(row)
+            if rank == 0:
+                pt = " ".join(f"{t}=" + "/".join(f"{v[k]:.1f}" for k in ("core_us", "sparse_mla_us", "indexer_us") if k in v)
+                              for t, v in per_type.items())
+                print(f"[bench_core] {args.model} tp={args.tp} B={B} C={args.ctx}: core[/sparse/indexer] us per layer {pt}", flush=True)
+            torch.cuda.synchronize()
             continue
         tot = sum(mix.values())
         avg = {
@@ -326,6 +471,8 @@ def main():
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--out", default="")
     ap.add_argument("--profile", action="store_true", help="kernel table of the aside path instead of timing")
+    ap.add_argument("--core", action="store_true", help="attention core only (sglang kernel-benchmark boundary)")
+    ap.add_argument("--spread", action="store_true", help="spread request positions around ctx (always on with --core)")
     args = ap.parse_args()
     os.environ.setdefault("MINISGL_MOE_EXEC", "torch")
     if args.tp == 1:
