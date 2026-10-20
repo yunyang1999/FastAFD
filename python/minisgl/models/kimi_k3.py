@@ -299,7 +299,7 @@ class KimiMLAAttention(BaseOP):
         cache[out_loc, : a.kv_lora] = ckv
         cache[out_loc, a.kv_lora :] = ckv_kr[:, a.kv_lora :]
         q_abs = torch.bmm(q_nope.transpose(0, 1), self._w_uk).transpose(0, 1)  # [T, H, lora]
-        o_lat = backend.mla_attn(self.layer_id, q_abs.contiguous(), q_rope.contiguous())  # [T, H, lora]
+        o_lat = backend.mla_attn(self.layer_id, q_abs, q_rope)  # [T, H, lora]
         o = torch.bmm(o_lat.transpose(0, 1), self._w_uv_t).transpose(0, 1)  # [T, H, v]
         o = o.reshape(T, H * a.v_head) * torch.sigmoid(self.g_proj.forward(x))
         return self.o_proj.forward(o)

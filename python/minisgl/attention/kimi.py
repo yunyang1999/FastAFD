@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List
 
 import torch
+import triton
+import triton.language as tl
 from minisgl.core import Batch, get_global_ctx
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -163,28 +165,35 @@ class KimiAttnBackend(BaseAttnBackend):
         cache = self.pool.mla_cache(layer_id)
         ckv = cache[:, : self.kv_lora].unsqueeze(1)
         kpe = cache[:, self.kv_lora :].unsqueeze(1)
-        return md.wrapper.run(q_abs, q_rope, ckv, kpe)
+        return md.wrapper.run(q_abs.contiguous(), q_rope.contiguous(), ckv, kpe)
 
     def _trtllm_decode(self, layer_id: int, q_abs: torch.Tensor, q_rope: torch.Tensor, md: KimiMetadata) -> torch.Tensor:
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
         B, H, _ = q_abs.shape
-        cache = self.pool.mla_cache(layer_id).view(-1, 1, self.page_size, self.kv_lora + self.rope)
-        out = torch.empty((B, H, self.kv_lora), dtype=torch.bfloat16, device=q_abs.device)
+        D = self.kv_lora + self.rope
+        # the query kernel takes any row strides but needs unit stride inside a head
+        q_abs = q_abs if q_abs.stride(-1) == 1 else q_abs.contiguous()
+        q_rope = q_rope if q_rope.stride(-1) == 1 else q_rope.contiguous()
+        cache = self.pool.mla_cache(layer_id).view(-1, 1, self.page_size, D)
+        outs = []
         for h0, hn, hp in self.head_chunks:
-            # zero-padded query heads up to a count every trtllm-gen variant takes
-            # (the MLA kernels tile heads by 16/32/64/128); padded rows are dropped
-            q = torch.zeros((B, 1, hp, self.kv_lora + self.rope), dtype=torch.bfloat16, device=q_abs.device)
-            q[:, 0, :hn, : self.kv_lora] = q_abs[:, h0 : h0 + hn]
-            q[:, 0, :hn, self.kv_lora :] = q_rope[:, h0 : h0 + hn]
+            # query [B, 1, hp, 576] = [q_abs | q_rope] with zero-padded heads up to a
+            # count every trtllm-gen variant takes; one Triton pass
+            q = torch.empty((B, 1, hp, D), dtype=torch.bfloat16, device=q_abs.device)
+            if B:
+                _mla_query_kernel[(B * hp,)](
+                    q_abs, q_rope, q, h0, hn, hp, q_abs.stride(0), q_abs.stride(1), q_rope.stride(0), q_rope.stride(1),
+                    LORA=self.kv_lora, ROPE=self.rope, BLOCK=1024, num_warps=4,
+                )
             o = trtllm_batch_decode_with_kv_cache_mla(
                 query=q, kv_cache=cache, workspace_buffer=self.trtllm_ws,
                 qk_nope_head_dim=128, kv_lora_rank=self.kv_lora, qk_rope_head_dim=self.rope,
                 block_tables=md.block_tables, seq_lens=md.seq_lens, max_seq_len=self.max_seq_len,
                 bmm1_scale=self.scale, bmm2_scale=1.0,
             )
-            out[:, h0 : h0 + hn] = o.view(B, hp, self.kv_lora)[:, :hn]
-        return out
+            outs.append(o.view(B, hp, self.kv_lora)[:, :hn])
+        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)
 
     # ------------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
@@ -240,6 +249,21 @@ class KimiAttnBackend(BaseAttnBackend):
 
     def forward(self, q, k, v, layer_id, batch):  # pragma: no cover
         raise RuntimeError("KimiAttnBackend is driven by the Kimi attention modules")
+
+
+@triton.jit
+def _mla_query_kernel(qa_ptr, qr_ptr, out_ptr, h0, hn, hp, sa_b, sa_h, sr_b, sr_h,
+                      LORA: tl.constexpr, ROPE: tl.constexpr, BLOCK: tl.constexpr):
+    """out [B, hp, LORA+ROPE] = [q_abs | q_rope] of heads h0..h0+hn, zero rows above hn."""
+    r = tl.program_id(0)
+    b = r // hp
+    h = r - b * hp
+    j = tl.arange(0, BLOCK)
+    valid = h < hn
+    a = tl.load(qa_ptr + b * sa_b + (h0 + h) * sa_h + j, mask=valid & (j < LORA), other=0.0)
+    rr = tl.load(qr_ptr + b * sr_b + (h0 + h) * sr_h + (j - LORA), mask=valid & (j >= LORA) & (j < LORA + ROPE), other=0.0)
+    v = tl.where(j < LORA, a, rr)
+    tl.store(out_ptr + r * (LORA + ROPE) + j, v, mask=j < LORA + ROPE)
 
 
 def trtllm_mla_head_chunks(num_heads: int) -> list[tuple[int, int, int]]:
