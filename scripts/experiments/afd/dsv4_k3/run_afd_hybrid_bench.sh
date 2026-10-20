@@ -11,7 +11,12 @@
 #   MAX_TOKENS (64), AFD_NUM_MB (2), AFD_DECODE_GRAPH_BS (per-MB buckets),
 #   MEMORY_RATIO (0.85), MAX_SEQ_LEN (PROMPT_LEN+MAX_TOKENS+64), DUMMY_WEIGHT (1),
 #   AFD_MAX_BATCHED_TOKENS (2048; prefill chunk and MegaMoE bucket), MINISGL_TOKENIZER_PATH, RAY_ADDRESS (auto),
-#   MINISGL_AFD_ATTN_NODES / MINISGL_AFD_MLP_NODES (explicit placement)
+#   MINISGL_AFD_ATTN_NODES / MINISGL_AFD_MLP_NODES (explicit placement),
+#   EXTRA_SERVER_ARGS (appended to the server --extra-args),
+#   GREEDY_OUT (fixed-prompt greedy tokens instead of the sweep),
+#   PROMPT_FILE + NUM_PROMPTS (real text prompts instead of the sweep, cut to
+#   PROMPT_LEN tokens) and ROUTING_OUT / ROUTING_NOTE (merge the per-rank
+#   MINISGL_DUMP_EXPERT_LOAD dumps into one per-layer routing file)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +79,7 @@ export MINISGL_AFD_MAX_COMM_TOKENS="${MINISGL_AFD_MAX_COMM_TOKENS:-$AFD_MAX_BATC
 
 EXTRA="--attention-backend $ATTN_BACKEND --memory-ratio $MEMORY_RATIO"
 [[ "$DUMMY_WEIGHT" == "1" ]] && EXTRA="$EXTRA --dummy-weight"
+EXTRA="$EXTRA ${EXTRA_SERVER_ARGS:-}"
 
 echo "AFD hybrid bench: model=$MODEL_PATH arch=$ARCH A=$AFD_ATTN_DP_SIZE F=$AFD_MLP_DP_SIZE mb=$AFD_NUM_MB"
 echo "  batch_sizes=$BATCH_SIZES graph_bs=$AFD_DECODE_GRAPH_BS prompt=$PROMPT_LEN max_tokens=$MAX_TOKENS"
@@ -121,6 +127,30 @@ if [[ -n "${GREEDY_OUT:-}" ]]; then  # fixed-prompt greedy tokens instead of the
   stop_server
   trap - EXIT
   exit $rc
+fi
+
+if [[ -n "${PROMPT_FILE:-}" ]]; then  # real text prompts (routing capture / sanity) instead of the sweep
+  python "$SCRIPT_DIR/prompt_file_client.py" --url "http://127.0.0.1:$PORT" --prompt-file "$PROMPT_FILE" \
+    --tokenizer "${MINISGL_TOKENIZER_PATH:-$MODEL_PATH}" --num-prompts "${NUM_PROMPTS:-1152}" \
+    --prompt-len "$PROMPT_LEN" --max-tokens "$MAX_TOKENS" --timeout "${CLIENT_TIMEOUT:-7200}" \
+    --out "$RUN_DIR/prompt_file_client.json" > "$RUN_DIR/client.log" 2>&1 &
+  CLIENT_PID=$!
+  while kill -0 "$CLIENT_PID" 2>/dev/null; do
+    if grep -qs "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log; then
+      echo "worker failure:" >&2; grep -hs -A3 "hot_rpc_loop:error" "$RUN_DIR"/ray_logs/*.log | tail -20 >&2
+      kill "$CLIENT_PID" 2>/dev/null; exit 3
+    fi
+    sleep 5
+  done
+  wait "$CLIENT_PID" || { echo "client failed" >&2; tail -20 "$RUN_DIR/client.log" >&2; exit 4; }
+  cat "$RUN_DIR/client.log"
+  stop_server
+  trap - EXIT
+  if [[ -n "${ROUTING_OUT:-}" ]]; then  # per-rank MINISGL_DUMP_EXPERT_LOAD dumps -> one per-layer file
+    python "$SCRIPT_DIR/merge_expert_load.py" --dumps "$RUN_DIR/ray_logs/expert_load_attention*.json" \
+      --out "$ROUTING_OUT" --note "${ROUTING_NOTE:-}"
+  fi
+  exit 0
 fi
 
 python "$SCRIPT_DIR/bench_client.py" --url "http://127.0.0.1:$PORT" \

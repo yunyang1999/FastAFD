@@ -30,7 +30,8 @@ def run(args) -> None:
     with urllib.request.urlopen(req, timeout=args.timeout) as resp:
         res = json.loads(resp.read())
     ids = [c.get("token_ids") or [] for c in res["choices"]]
-    json.dump({"prompts": PROMPTS, "token_ids": ids}, open(args.out, "w"), indent=1)
+    texts = [(c.get("message") or {}).get("content", "") for c in res["choices"]]
+    json.dump({"prompts": PROMPTS, "token_ids": ids, "texts": texts}, open(args.out, "w"), indent=1)
     print(json.dumps({"out": args.out, "lens": [len(x) for x in ids]}))
 
 
