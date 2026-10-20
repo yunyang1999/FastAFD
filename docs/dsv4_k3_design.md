@@ -386,10 +386,11 @@ routed MegaMoE stage (`DSV4Routed`: FP8 cast, M2N kernel, all-gather), shared ex
 (`DSV4Shared`), mHC / norms / residual (`DSV4Layer` rest), `DSV4Head` and everything
 outside the layers (embedding, sampler, copies). The eager run gives kernel time
 per bucket; the graph run gives the per-step total and the idle time that the
-measured step contains. `MINISGL_DSV4_COLO_SHARED_SP=1` moves the colocated shared
-expert onto this rank's token shard inside the MegaMoE executor (before its
+measured step contains. `MINISGL_DSV4_COLO_SHARED_SP` (default 1) runs the colocated
+shared expert on this rank's token shard inside the MegaMoE executor (before its
 all-gather; replicated weights, one bf16 add, the same rounding as before) instead
-of recomputing it for all tokens on every rank.
+of recomputing it for all tokens on every rank (`=0`, the configuration of the first
+colocated sweep): -0.7 ms per step at 256 tokens and -2.2 ms at 1024 tokens.
 
 **sglang baseline.** `sgl_colocated_bench.sh` launches sglang 0.5.18 with
 `--tp 4 --ep-size 4 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.85

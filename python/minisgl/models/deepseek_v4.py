@@ -135,8 +135,9 @@ _ATTN_ELEMWISE_IMPL = os.environ.get("MINISGL_DSV4_ATTN_ELEMWISE", "sglang").low
 _INDEX_STORE_IMPL = os.environ.get("MINISGL_DSV4_INDEX_STORE", "sglang").lower()  # sglang | triton
 _WO_A_FP8 = os.environ.get("MINISGL_DSV4_WO_A", "fp8").lower() == "fp8"
 # colocated MoE: run the shared expert on this rank's token shard inside the MegaMoE
-# executor (before its all-gather) instead of replicating it over all tokens on every rank
-_COLO_SHARED_SP = os.environ.get("MINISGL_DSV4_COLO_SHARED_SP", "0") == "1"
+# executor (before its all-gather) instead of replicating it over all tokens on every
+# rank (default; measured -0.7 ms/step at 256 tokens and -2.2 ms at 1024 on GB200 TP4)
+_COLO_SHARED_SP = os.environ.get("MINISGL_DSV4_COLO_SHARED_SP", "1") == "1"
 
 
 def rope_table_len() -> int:
@@ -749,9 +750,9 @@ class DSV4MoE(BaseOP):
             # colocated MegaMoE runs the routed experts; the shared expert runs
             # locally (the synthetic shared slot of the colocated kernel faults
             # at EP=1, see docs/dsv4_k3_design.md): either on this rank's token
-            # shard inside the executor (MINISGL_DSV4_COLO_SHARED_SP=1, before the
-            # all-gather; replicated weights, same arithmetic, 1/EP of the FLOPs)
-            # or replicated over all tokens afterwards.
+            # shard inside the executor (default, MINISGL_DSV4_COLO_SHARED_SP=1: before
+            # the all-gather; replicated weights, same arithmetic, 1/EP of the FLOPs)
+            # or replicated over all tokens afterwards (MINISGL_DSV4_COLO_SHARED_SP=0).
             shared = self.shared_experts.forward if self.shared_experts is not None and _COLO_SHARED_SP else None
             with nvtx_range("DSV4Routed"):
                 y = executor(x, ids, w, self.experts.megamoe(), shared=shared)
