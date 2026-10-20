@@ -403,7 +403,121 @@ TP-sharded expert configuration (`--tp 4` without `--ep-size`) does not run in
 0.5.18 with any MoE runner (auto/triton: hidden-size mismatch; deep_gemm: the DSV4
 JIT activation requires `D // 8 >= num_experts`; flashinfer_trtllm: top-k output
 format assertion; flashinfer_cutlass: `Fp8MoEMethod` has no `runner`), so the
-colocated sglang numbers are EP4.
+colocated sglang numbers are EP4. A repeat of the 4K sweep in a second job agreed
+within 1-3 % up to b = 192 and within 10 % at b = 256 (30.5 vs 33.7 ms). At 32K the
+KV pool at `--mem-fraction-static 0.85` holds ~455 requests, so b >= 128 per GPU
+queued and those points are not reported.
+
+**Kimi-K3 non-AFD baseline (not obtained).** sglang 0.5.18 has a Kimi-K3 model, but
+only as the multimodal architecture `KimiK3ForConditionalGeneration`: its tokenizer
+manager instantiates the K3 multimodal processor, which needs the checkpoint's own
+processor class (`media_processor`, remote code -- not executed here), and fails with
+`AttributeError: TokenizersBackend has no attribute media_processor` before any
+weight is loaded; `--skip-tokenizer-init` does not bypass it and
+`--language-model-only` rejects the architecture. The attempted configuration was
+4 nodes, `--tp 16 --dp 8 --enable-dp-attention --ep-size 16 --load-format dummy`
+(attention TP2 per DP rank) with a2a `none` and `deepep`; the K3 colocated side
+therefore stays AIC-based. FastAFD's colocated engine is single-node and K3 does
+not fit on one node.
+
+**Kimi-K3 AFD limits in this build.** 16A16F runs at 4K for b <= 32 per attention
+GPU; b = 64 (TP1) and b = 96/128 (TP2) and every 32K case fail with
+`CUDA error: unspecified launch failure` in the K3 attention path
+(`k3_attn_res.attn_res_fused_tma` in the first forward at 64 requests per rank;
+decode graph replay at 192 requests per TP2 pair and at 16 requests x 33K context),
+after KV capacity was raised (`MEMORY_RATIO=0.95`) for the cases that first failed
+to schedule (0.85 left 2423 / 15441 pages per rank for b = 64 TP1 / b = 128 TP2).
+These are kernel defects outside this phase.
+
+**Colocated breakdown, measured** (TP4 = EP4, real weights, 4K/1K, GB200; ms per
+decode step, medians over 5 profiled steps; `graph` = CUDA graphs as in the sweep,
+`eager` = labelled eager trace, kernel time only):
+
+| b / GPU (tokens / step) | step (sweep) | GPU span, graph | busy | idle in span | attention core | attention proj + all-reduce | router | routed MegaMoE | shared expert | mHC / norms | lm_head + outside layers |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 (256), replicated shared expert | 21.23 | 21.67 | 19.90 | 1.76 | | | | | | | |
+| 64 (256), sharded shared expert | - | 20.95 | 19.25 | 1.71 | 3.50 | 3.13 | 0.51 | 8.54 | 1.50 | 1.56 | 0.62 |
+| 256 (1024), replicated shared expert | 34.98 | 35.52 | 33.71 | 1.77 | | | | | | | |
+| 256 (1024), sharded shared expert | - | 33.31 | 31.59 | 1.72 | 9.29 | 5.00 | 0.59 | 11.43 | 1.75 | 2.94 | 1.81 |
+
+Inside the buckets at b = 256: routed MegaMoE = M2N kernel 8.34 (weight-streaming
+bound: +1.0 ms for 4x the tokens of b = 64; 35 GB of MXFP4 expert weights per GPU
+and step) + NCCL all-gather of the token shards 2.20 (LL ring kernel, ~50 us per 8 MB)
++ copies 0.76; attention core = sparse FMHA 6.82 + compressor/indexer GEMMs 1.14 +
+KV ring/index copies 1.19; projections = FP8 GEMMs 2.06 + symmetric all-reduce 1.31
++ per-token FP8 casts 0.67 + q/kv norm-RoPE 0.65; mHC pre/post + hc-prenorm GEMM
+2.94. 2.5k kernels per step (60 per layer); the graph replay leaves 1.7 ms of
+launch gaps. The sharded shared expert saves 0.7 ms (b 64) and 2.2 ms (b 256) per
+step (dense GEMM and the fp32 cast/add kernels of the replicated path) and is the
+default. The remaining gap to sglang EP4 (18.2 ms at b 64, 30.5 ms at b 256 with FP8
+experts, i.e. twice the expert bytes) is spread over the glue of the colocated path:
+the per-layer all-gather after the SP MegaMoE stage (sglang's EP path keeps the
+replicated tokens and all-reduces once), ~200 copy/cast kernels per step, separate
+FP8 cast kernels in front of every GEMM, and the many small mHC/norm kernels -- none
+of them a single fix.
+
+At 32K/1K the first colocated sweep was host-bound: the GPU span per step at b = 8
+was 15.5 ms (busy 13.9) while the scheduler's step period was 37-43 ms, growing
+linearly with the batch (1.03 s at b = 192); the AFD units and sglang do not show
+this (28A4F 32K b 128 = 33.6 ms = its 4K value). py-spy on the scheduler ranks put
+~30 % of the host samples in `Req.append_host`: a `torch.cat` of the whole sequence
+per request and decode step, which beyond 32K elements ATen runs on the OpenMP
+pool (~0.4 ms per call). The append now writes into a preallocated per-request host
+buffer (commit "core: amortised Req.append_host"); the 32K colocated sweep was
+repeated with that fix (table below), the first sweep's points are kept under
+`results/.../superseded/`.
+
+**Results** (median decode step ms over 57 timed steps; GB200 NVL72, campaign of
+2026-10-20; `summary.csv` / `step_time_tables.md` carry p90 and throughput).
+
+DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
+
+| b | 12A4F m2 (4K) | 24A8F m2 (4K) | 28A4F m2 (4K) | 28A4F m2 (32K) | sglang EP4 (4K) | sglang EP4 (32K) | FastAFD colo TP4=EP4 (4K) | FastAFD colo (32K) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 14.51 | 14.34 | 15.33 | 15.66 | 10.55 | 10.75 | 14.22 | 14.68 |
+| 16 | 15.46 | 14.66 | 16.52 | 16.89 | 12.63 | 13.08 | 15.67 | 16.29 |
+| 32 | 17.15 | 15.21 | 18.66 | 18.91 | 14.41 | 14.87 | 17.60 | 18.32 |
+| 64 | 20.82 | 15.90 | 23.30 | 23.35 | 18.15 | 19.32 | 20.43 | 22.03 |
+| 128 | 29.39 | 18.96 | 33.53 | 33.58 | 22.81 | KV-limited | 24.86 | 27.22 |
+| 192 | 38.35 | 25.27 | 44.09 | prefill > 30 min | 25.86 | KV-limited | 28.24 | 31.63 |
+| 256 | launch failure | 31.66 | 54.80 | prefill > 30 min | 30.51 | - | 32.58 | - |
+
+Per-GPU decode throughput at b = 256 (4K): 24A8F 6064 tok/s/GPU, 28A4F 4087, sglang
+EP4 8389, FastAFD colocated 7858; 12A4F at b = 192: 3755. The sglang EP4 4K sweep
+repeated in a second job agreed within 1-3 % up to b = 192 and 10 % at b = 256
+(33.7 ms); the MegaMoE-a2a variant (`--moe-a2a-backend megamoe`) is within the same
+spread (results `variants/sglang_ep4mm`). sglang 32K b >= 128 queued requests (KV
+pool at mem-fraction 0.85 holds ~455 x 33K-token requests) and is not reported.
+12A4F b = 256 fails deterministically (`afd_ag_materialize` step 70 of the prefill,
+`CUDA error: unspecified launch failure`, twice). 28A4F 32K b >= 192: the prefill of
+5376 / 7168 requests x 33K tokens exceeds the per-case client timeout (30 min).
+
+Kimi-K3 (dummy weights, sampled decoding) AFD 16A16F m2, 4K/1K: b8 48.50, b16
+50.32, b32 57.62 ms (82 / 159 / 278 tok/s/GPU); b >= 64 and every 32K case fail in
+the K3 attention kernels (see above), no non-AFD baseline runs in sglang 0.5.18.
+
+Qwen3-235B-A22B-FP8, real weights, AFD 16A8F (6 GPU nodes + GPU-less head), 4K/1K,
+regression protocol: m = 2: b32 15.38, b64 18.03, b96 (launch failure in the decode
+graph at the first attempt; retry pending), b128 26.16 ms; m = 3: b32 20.97, b64
+23.20, b96 26.75, b128 33.10 ms. m = 3 costs 4-7 ms per step more than m = 2 at
+every batch (three smaller microbatches per step on the same 16 attention GPUs).
+
+**Host overhead.** Coordinator busy time per decode step divided by the requests in
+the step converges to 3.86-3.96 us/request for the DSV4 units at b >= 128 (12A4F
+3.86 / 3.88 at b 128 / 192; 24A8F 3.87 / 3.89 / 3.87 at b 128 / 192 / 256; 28A4F
+3.96 / 3.95 / 4.06; 28A4F 32K b 128 4.10), i.e. the Qwen3-235B anchor eta = 3.87 us
+holds for DeepSeek-V4-Flash; small batches are intercept-dominated (8-9 us at b = 8;
+linear fit over all AFD points: busy = 0.56 ms + 3.84 us x requests). K3 b 32 4.79,
+Qwen3 m3 b 96 3.65, m2 b 32 4.5.
+
+**Profiler decomposition, 28A4F 4K (dp0 workers, 7 steps).** The expert worker runs
+one persistent MegaMoE EG kernel that is busy for the whole step (b 32: 18.72 ms of
+an 18.66 ms step; b 128: 33.66 of 33.53), so the unit is expert-bound at both
+batches. The attention worker's span equals the step (18.7 / 33.65 ms, idle 0.7); its
+own kernels take ~13.5 / 14.7 ms (FP8 dense GEMMs 5.66 / 5.99, mHC + norm + RoPE
+3.27 / 3.42, attention 2.29 / 2.88, copies 1.16 / 1.41, FP8 casts 0.66 / 0.77, router
+0.22 / 0.25), the rest is inside the M2N AG kernels waiting for the experts (20.3 /
+48.8 ms summed over the two microbatch streams).
 
 **Scripts** (`scripts/experiments/afd/dsv4_k3/`): `afd_cases.sh` (+ `E2E_OUT_DIR`,
 `ISL`, `OSL`, attention TP as a 6th case field), `colo_bench.sh` (FastAFD
