@@ -241,10 +241,10 @@ unless noted, MegaMoE dispatch bucket 2048.
 | DeepSeek-V4-Flash, 28A4F | 33.3 ms | 34.3 | 35.3 | 52.7 | 59.5 |
 | DeepSeek-V4-Flash, 2A2F, mb=1 | 20.6 ms | 21.9 | 31.5 | 36.2 | 45.2 |
 
-These are end-to-end FastAFD steps of this implementation: the attention-side
-kernels (KDA, MLA, DSV4 compressor/indexer/sparse MLA, mHC) are functional,
-not tuned, so the small-batch floor is attention-side bound (K3: ~0.4 ms per
-layer and microbatch over 93 layers).
+These were measured with the first, untuned attention-side kernels; section 9
+replaces them with sglang's decode kernels. With those, the same DeepSeek-V4-Flash
+2A2F mb=1 point (one node, GPUs on the Ray head) runs at 11.8 / 12.9 / 14.0 /
+16.3 / 20.6 ms for 8 / 16 / 32 / 64 / 128 per attention GPU (1.7-2.3x faster).
 
 ## 9. Attention-side decode kernels vs sglang 0.5.18 (GB200)
 
