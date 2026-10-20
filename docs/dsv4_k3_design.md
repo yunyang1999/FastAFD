@@ -497,10 +497,12 @@ Kimi-K3 (dummy weights, sampled decoding) AFD 16A16F m2, 4K/1K: b8 48.50, b16
 the K3 attention kernels (see above), no non-AFD baseline runs in sglang 0.5.18.
 
 Qwen3-235B-A22B-FP8, real weights, AFD 16A8F (6 GPU nodes + GPU-less head), 4K/1K,
-regression protocol: m = 2: b32 15.38, b64 18.03, b96 (launch failure in the decode
-graph at the first attempt; retry pending), b128 26.16 ms; m = 3: b32 20.97, b64
-23.20, b96 26.75, b128 33.10 ms. m = 3 costs 4-7 ms per step more than m = 2 at
-every batch (three smaller microbatches per step on the same 16 attention GPUs).
+regression protocol: m = 2: b32 15.38, b64 18.03, b96 22.83, b128 26.16 ms; m = 3:
+b32 20.97, b64 23.20, b96 26.75, b128 33.10 ms. m = 3 costs 4-7 ms per step more
+than m = 2 at every batch (three smaller microbatches per step on the same 16
+attention GPUs). One m = 2 b96 attempt and the first m = 3 b64/b128 attempts died
+with CUDA launch failures / barrier timeouts after an earlier crash in the same Ray
+cluster; fresh jobs reproduced every point.
 
 **Host overhead.** Coordinator busy time per decode step divided by the requests in
 the step converges to 3.86-3.96 us/request for the DSV4 units at b >= 128 (12A4F
@@ -518,6 +520,15 @@ own kernels take ~13.5 / 14.7 ms (FP8 dense GEMMs 5.66 / 5.99, mHC + norm + RoPE
 3.27 / 3.42, attention 2.29 / 2.88, copies 1.16 / 1.41, FP8 casts 0.66 / 0.77, router
 0.22 / 0.25), the rest is inside the M2N AG kernels waiting for the experts (20.3 /
 48.8 ms summed over the two microbatch streams).
+
+**Profiler decomposition, K3 16A16F b 32, 4K (dp0 workers, 7 steps).** Expert worker:
+one MegaMoE EG kernel busy for the whole 57.8 ms step (step 57.6). Attention worker:
+span 57.8, idle 0.3; kernel time summed over its two microbatch streams 107 ms, of
+which M2N AG (incl. waiting for the experts) 43.5, BF16 dense GEMMs 46.2 (nvjet
+projection kernels; K3's attention and KDA projections are not quantised), KDA /
+attention kernels 11.3 (`kda_packed_decode` 5.3), copies 4.4, norms 1.0, router 0.7
+-- both sides of the K3 unit are saturated at b 32, so the next unit (56A16F)
+rather than the batch is where K3 throughput would come from.
 
 **Scripts** (`scripts/experiments/afd/dsv4_k3/`): `afd_cases.sh` (+ `E2E_OUT_DIR`,
 `ISL`, `OSL`, attention TP as a 6th case field), `colo_bench.sh` (FastAFD
