@@ -596,11 +596,15 @@ class AfdAgDecodeGraphRunner:
                 out_buf[s:e].copy_(final_mb)
 
         # eager warmup run (lazy init out of the graph), sync BOTH streams
+        alloc_pre = torch.cuda.memory_allocated(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
         with torch.cuda.stream(engine_stream):
             _fn()
         engine_stream.synchronize()
         for stream in lane_streams:
             stream.synchronize()
+        alloc_eager = torch.cuda.memory_allocated(self.device)
+        peak_eager = torch.cuda.max_memory_allocated(self.device)
         free_pre, _ = torch.cuda.mem_get_info(self.device)
         graph, self._pool = capture_cuda_graph(
             device=self.device,
@@ -618,7 +622,9 @@ class AfdAgDecodeGraphRunner:
             f"[{self.label}] afd_ag_decode_graph mb warmup:done total={total} "
             f"mb_bs={mb_bs} pipeline_mb=1 schedule=paper_pipeline "
             f"lanes={len(lane_streams)} free_gib={free_pre / (1 << 30):.2f}->{free_b / (1 << 30):.2f} "
-            f"reserved_gib={torch.cuda.memory_reserved(self.device) / (1 << 30):.2f}",
+            f"reserved_gib={torch.cuda.memory_reserved(self.device) / (1 << 30):.2f} "
+            f"eager_alloc_gib={alloc_pre / (1 << 30):.2f}->{alloc_eager / (1 << 30):.2f} "
+            f"(peak {peak_eager / (1 << 30):.2f})",
             flush=True,
         )
 

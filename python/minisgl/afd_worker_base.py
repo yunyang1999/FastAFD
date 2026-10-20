@@ -778,7 +778,9 @@ class BaseAfdWorker:
             f"[{self.role} rank={self.tp_rank}] afd_runtime:init_done "
             f"ag={ag_size} eg={eg_size} bucket={bucket} "
             f"raw_max_comm_tokens={int(getattr(self, 'max_comm_tokens', 0))} "
-            f"dp_fanin={dp_fanin}",
+            f"dp_fanin={dp_fanin} cuda_alloc_gib={torch.cuda.memory_allocated() / (1 << 30):.2f} "
+            f"reserved_gib={torch.cuda.memory_reserved() / (1 << 30):.2f} "
+            f"free_gib={torch.cuda.mem_get_info()[0] / (1 << 30):.2f}",
             flush=True,
         )
 
@@ -847,7 +849,9 @@ class BaseAfdWorker:
             log_line(
                 self.log_path,
                 f"[{self.role} rank={self.tp_rank}] afd_hybrid_ag_model loaded "
-                f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f}",
+                f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f} "
+                f"reserved_gib={torch.cuda.memory_reserved() / (1024**3):.2f} "
+                f"free_gib={torch.cuda.mem_get_info()[0] / (1024**3):.2f}",
                 flush=True,
             )
         else:

@@ -33,6 +33,11 @@ def _quant_fp8_block(w: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, t
 
 
 def _normal(shape, std, device, gen, dtype):
+    # sampled in place in the target dtype: no fp32 temporaries, so every large
+    # weight keeps an allocator segment of its own (weights merged after loading
+    # free whole segments instead of leaving holes)
+    if dtype in (torch.bfloat16, torch.float16, torch.float32):
+        return torch.empty(shape, device=device, dtype=dtype).normal_(0.0, std, generator=gen)
     return (torch.randn(shape, device=device, generator=gen, dtype=torch.float32) * std).to(dtype)
 
 

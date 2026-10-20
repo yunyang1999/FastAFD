@@ -126,6 +126,11 @@ _ROUTER_IMPL = _os.environ.get("MINISGL_K3_ROUTER", "sglang").lower()
 _MOE_FRONT_IMPL = _os.environ.get("MINISGL_K3_MOE_FRONT", "sglang").lower()
 
 
+def _release_cached() -> None:
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
 def _all_reduce(x: torch.Tensor) -> torch.Tensor:
     if get_tp_info().size > 1:
         return DistributedCommunicator().all_reduce(x)
@@ -470,14 +475,22 @@ class KimiDecoderLayer(BaseOP):
         self._cw_mlp: torch.Tensor | None = None
 
     def prepare(self) -> None:
-        """Post-load weight merges / absorption (must run before CUDA-graph capture)."""
+        """Post-load weight merges / absorption (must run before CUDA-graph capture).
+
+        Each merge allocates the merged weight and frees the loaded pieces; the
+        cache is emptied after every step so the next allocation cannot split
+        the freed blocks (on the attention ranks of the full model those holes
+        otherwise strand ~33 GiB in the caching allocator)."""
         if self.is_kda:
             self.self_attn.merge_weights()
         else:
             self.self_attn._absorb()
+            _release_cached()
             self.self_attn.merge_weights()
+        _release_cached()
         if self.block_sparse_moe is not None:
             self.block_sparse_moe.merge_front()
+            _release_cached()
         self._res_weights()
 
     def _res_weights(self):
