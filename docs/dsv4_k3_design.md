@@ -169,15 +169,17 @@ Colocated (one node, TP = EP = 4):
 ```bash
 # DeepSeek-V4 (Flash or Pro)
 python -m minisgl --model-path $DIR --dummy-weight --tensor-parallel-size 4 \
-  --attention-backend dsv4 --page-size 128 --max-running-requests 64 \
+  --attention-backend dsv4 --page-size 256 --max-running-requests 64 \
   --cuda-graph-max-bs 64 --max-seq-len-override 4096 --memory-ratio 0.85
 # Kimi-K3 (MINISGL_TOKENIZER_PATH=<other tokenizer dir> if tiktoken is missing)
 python -m minisgl --model-path $DIR --dummy-weight --tensor-parallel-size 4 \
-  --attention-backend kimi --page-size 1 --max-running-requests 64 \
+  --attention-backend kimi --page-size 64 --max-running-requests 64 \
   --cuda-graph-max-bs 64 --max-seq-len-override 4096 --memory-ratio 0.85
 ```
 
-Drop `--dummy-weight` to load a real checkpoint (`models/ckpt_loaders.py`).
+The engine forces the attention backend and page size of these models (DSV4:
+`dsv4`, 256; K3: `kimi`, 64). Drop `--dummy-weight` to load a real checkpoint
+(`models/ckpt_loaders.py`).
 `MINISGL_MOE_EXEC=torch` switches the routed experts from colocated MegaMoE to
 the torch reference executor.
 
@@ -231,6 +233,19 @@ sbatch -N 9 --segment=9 --account=<acct> --partition=<gb200 partition> --time=03
   uses the MXFP4-requantised weights that the MegaMoE expert workers run
   (colocated FP8 vs MXFP4 shared alone: 30 %), i.e. the difference is the
   shared-expert precision imposed by the measured MegaMoE stage.
+* Full DeepSeek-V4-Flash checkpoint (46 shards, read in place): colocated TP4 and
+  AFD 4A4F (two nodes, `HEAD_GPUS=1`) both answer the fixed prompt set sensibly
+  (Paris, Fibonacci code, special relativity, Jupiter, ...). Greedy agreement
+  over 8 x 32 tokens: FP8 vs BF16 KV rows (colocated) 68 %, AFD vs colocated
+  with BF16 KV 63 % and with FP8 KV 47 %; the runs agree on the answers and part
+  in the open-ended continuations, where near-ties flip with the cache precision
+  and the MXFP4 shared expert of the MegaMoE stage.
+* Real routing skew (DeepSeek-V4-Flash, AFD 4A4F, 1152 real text prompts cut to
+  2048 tokens, 16 sampled decode tokens, 4.46 M expert assignments): aggregated
+  expert-load CV 23 %, per-layer CV 150 % (mean) / 146 % (median), max/mean load
+  per layer 14.9 on average; the hash-routed layers 0-2 have CV 65-70 %. Saved as
+  `real_routing_dsv4_flash_perlayer.json` (schema `fastafd.expert-load.v2`) next
+  to the Qwen3 routing file.
 
 ### AFD step time vs batch (full depth, dummy weights, GB200 NVL72)
 
@@ -245,10 +260,19 @@ unless noted, MegaMoE dispatch bucket 2048.
 | DeepSeek-V4-Flash, 28A4F | 33.3 ms | 34.3 | 35.3 | 52.7 | 59.5 |
 | DeepSeek-V4-Flash, 2A2F, mb=1 | 20.6 ms | 21.9 | 31.5 | 36.2 | 45.2 |
 
-These were measured with the first, untuned attention-side kernels; section 9
-replaces them with sglang's decode kernels. With those, the same DeepSeek-V4-Flash
-2A2F mb=1 point (one node, GPUs on the Ray head) runs at 11.8 / 12.9 / 14.0 /
-16.3 / 20.6 ms for 8 / 16 / 32 / 64 / 128 per attention GPU (1.7-2.3x faster).
+These were measured with the first, untuned attention-side kernels (Ray head
+without GPUs, 9 nodes). With the decode kernels of section 9 and the head's GPUs
+in use (`HEAD_GPUS=1`, 8 nodes = 32 GPUs, one NVL72 domain):
+
+| model, shape | 8 | 16 | 32 | 64 | 128 (per attention GPU) |
+|---|---:|---:|---:|---:|---:|
+| Kimi-K3, 16A16F | 48.4 ms | 50.0 | 56.6 | 64.6 | - |
+| DeepSeek-V4-Flash, 28A4F | 14.3 ms | 14.6 | 16.0 | 20.5 | 33.0 |
+
+(1.5-1.6x faster for K3, 1.8-2.6x for DSV4-Flash; FP8 KV rows for DSV4-Flash, its
+BF16-row variant measured 15.5 / 15.2 / 16.5 / 20.7 / 33.1 ms.) The one-node
+DeepSeek-V4-Flash 2A2F mb=1 point runs at 11.8 / 12.9 / 14.0 / 16.3 / 20.6 ms
+(BF16 KV rows).
 
 ## 9. Attention-side decode kernels vs sglang 0.5.18 (GB200)
 
