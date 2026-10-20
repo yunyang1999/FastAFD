@@ -5,6 +5,7 @@ BaseAfdWorker owns the common per-GPU runtime used by AFD attention/model actors
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 import traceback
@@ -211,6 +212,28 @@ class BaseAfdWorker:
         self._control_profile_stop_step = int(
             os.environ.get("MINISGL_AFD_CONTROL_PROFILE_STOP_STEP", "0") or 0
         )
+        # torch.profiler window on the dp0/tp0 worker of each role
+        # (MINISGL_AFD_TORCH_PROFILE="<phase>:<first>:<count>": profile <count>
+        # consecutive <phase> steps starting at this worker's <first>-th such step;
+        # chrome trace + step list written next to the worker log, or into
+        # MINISGL_AFD_TORCH_PROFILE_DIR). Each profiled step's launches are wrapped
+        # in a record_function("afd_step[<id>]") so kernels can be attributed.
+        self._tprof_spec = os.environ.get("MINISGL_AFD_TORCH_PROFILE", "").strip()
+        self._tprof_dir = os.environ.get("MINISGL_AFD_TORCH_PROFILE_DIR", "").strip() or str(
+            Path(self.log_path).parent
+        )
+        dp_rank = self.mlp_dp_rank if role == "mlp" else self.attn_dp_rank
+        self._tprof_enabled = bool(self._tprof_spec) and int(tp_rank) == 0 and dp_rank == 0
+        self._tprof_phase, self._tprof_first, self._tprof_count = "decode", 0, 0
+        if self._tprof_enabled:
+            parts = self._tprof_spec.split(":")
+            self._tprof_phase = parts[0] or "decode"
+            self._tprof_first = int(parts[1]) if len(parts) > 1 and parts[1] else 20
+            self._tprof_count = int(parts[2]) if len(parts) > 2 and parts[2] else 10
+        self._tprof_seen = 0
+        self._tprof = None
+        self._tprof_rf = None
+        self._tprof_steps: list[int] = []
         self._recv_timeout_ms = max(1_000, int(rpc_timeout_ms))
         self._dual_stream_microbatch = self.afd_num_mb > 1
         self._comm_stream = torch.cuda.Stream(device=self.device)
@@ -347,6 +370,65 @@ class BaseAfdWorker:
 
     def _create_runtime(self, config: AfdRuntimeConfig):
         raise NotImplementedError
+
+    def _tprof_step_begin(self, step_id: int, phase: object) -> None:
+        if not self._tprof_enabled or str(phase) != self._tprof_phase:
+            return
+        self._tprof_seen += 1
+        if self._tprof is None:
+            if self._tprof_seen != self._tprof_first:
+                return
+            from torch.profiler import ProfilerActivity, profile
+
+            torch.cuda.synchronize(self.device)
+            self._tprof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+            self._tprof.__enter__()
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] torch_profile:start step_id={int(step_id)} "
+                f"{self._tprof_phase}_step_ordinal={self._tprof_seen} count={self._tprof_count}",
+                flush=True,
+            )
+        self._tprof_rf = torch.profiler.record_function(f"afd_step[{int(step_id)}]")
+        self._tprof_rf.__enter__()
+        self._tprof_steps.append(int(step_id))
+
+    def _tprof_step_end(self, step_id: int, phase: object) -> None:
+        if self._tprof is None or str(phase) != self._tprof_phase:
+            return
+        if self._tprof_rf is not None:
+            self._tprof_rf.__exit__(None, None, None)
+            self._tprof_rf = None
+        if len(self._tprof_steps) < self._tprof_count:
+            return
+        torch.cuda.synchronize(self.device)
+        self._tprof.__exit__(None, None, None)
+        dp_rank = self.mlp_dp_rank if self.role == "mlp" else self.attn_dp_rank
+        base = Path(self._tprof_dir) / f"torch_profile_{self.role}_dp{dp_rank}_rank{self.tp_rank}"
+        base.parent.mkdir(parents=True, exist_ok=True)
+        self._tprof.export_chrome_trace(str(base) + ".json")
+        with open(str(base) + "_meta.json", "w") as f:
+            json.dump(
+                {
+                    "role": self.role,
+                    "dp_rank": dp_rank,
+                    "tp_rank": self.tp_rank,
+                    "phase": self._tprof_phase,
+                    "steps": list(self._tprof_steps),
+                    "key_averages": self._tprof.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=60, max_name_column_width=100
+                    ),
+                },
+                f,
+            )
+        log_line(
+            self.log_path,
+            f"[{self.role} rank={self.tp_rank}] torch_profile:done steps={self._tprof_steps[0]}.."
+            f"{self._tprof_steps[-1]} trace={base}.json",
+            flush=True,
+        )
+        self._tprof = None
+        self._tprof_enabled = False
 
     def _control_profile_enabled(self, step_id: int) -> bool:
         start = int(self._control_profile_start_step)

@@ -604,9 +604,10 @@ class AfdExpertWorker(BaseAfdWorker):
                     continue
                 if not isinstance(cmd, AfdRunEGStepCmd):
                     raise RuntimeError(f"Unsupported EG command: {type(cmd).__name__}")
-                self._process_last_afd_eg(
-                    self._run_afd_eg_step(cmd.plan, sent_ns=cmd.sent_ns)
-                )
+                self._tprof_step_begin(cmd.plan.step_id, cmd.plan.phase)
+                in_flight = self._run_afd_eg_step(cmd.plan, sent_ns=cmd.sent_ns)
+                self._tprof_step_end(cmd.plan.step_id, cmd.plan.phase)
+                self._process_last_afd_eg(in_flight)
 
     def afd_overlap_loop(self) -> None:
         """Fixed two-step-ahead EG loop.
@@ -636,9 +637,11 @@ class AfdExpertWorker(BaseAfdWorker):
                     continue
                 if not isinstance(cmd, AfdRunEGStepCmd):
                     raise RuntimeError(f"Unsupported EG command: {type(cmd).__name__}")
+                self._tprof_step_begin(cmd.plan.step_id, cmd.plan.phase)
                 pending.append(
                     self._run_afd_eg_step(cmd.plan, sent_ns=cmd.sent_ns)
                 )
+                self._tprof_step_end(cmd.plan.step_id, cmd.plan.phase)
                 retire()
 
     def _log_plan_recv(

@@ -1019,9 +1019,11 @@ class AfdAttentionWorker(BaseAfdWorker):
                     self.handle_profiler_cmd(cmd)
                     continue
                 if isinstance(cmd, AfdRunAGStepCmd):
+                    self._tprof_step_begin(cmd.plan.step_id, cmd.plan.phase)
                     pending_afd_ag.append(
                         self._run_afd_ag_step(cmd.plan, sent_ns=cmd.sent_ns)
                     )
+                    self._tprof_step_end(cmd.plan.step_id, cmd.plan.phase)
                     retire_afd_ag()
                     continue
                 raise RuntimeError(

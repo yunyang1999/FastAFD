@@ -170,12 +170,20 @@ def _prepend_path_entry(path_value: str, entry: str) -> str:
     return os.pathsep.join(parts)
 
 
+# Prefixes forwarded as whole families (model kernel / cache knobs read inside the
+# workers and the torch.profiler window); mirrors afd_support._RUNTIME_ENV_PREFIXES.
+_RAY_ENV_PREFIXES = ("MINISGL_DSV4_", "MINISGL_K3_", "MINISGL_AFD_TORCH_PROFILE")
+
+
 def _build_ray_runtime_env(nsys_bin: str | None = None) -> dict[str, dict[str, str]]:
     env_vars = {
         key: value
         for key in _RAY_ENV_KEYS
         if (value := os.environ.get(key))
     }
+    for key, value in os.environ.items():
+        if key.startswith(_RAY_ENV_PREFIXES) and value:
+            env_vars[key] = value
     python_dir = str(Path(__file__).resolve().parents[2])
     env_vars["PYTHONPATH"] = _prepend_path_entry(
         env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", "")),

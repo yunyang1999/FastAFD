@@ -168,3 +168,8 @@ class PrefillManager:
     @property
     def runnable(self) -> bool:
         return len(self.pending_list) > 0
+
+    @property
+    def has_chunked_in_flight(self) -> bool:
+        """A request already holds a table slot but still has prefill chunks to run."""
+        return any(p.chunked_req is not None for p in self.pending_list)

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import atexit
+import json
+import os
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -187,6 +191,17 @@ class Scheduler(SchedulerIOMixin):
         self._ray_nsys_enabled = bool(getattr(config, "ray_nsys", False))
         self._nsys_warmup_complete = not self._ray_nsys_enabled
         self._nsys_runtime_started = False
+        # Per-forward step trace (MINISGL_SCHED_STEP_TRACE=<file>): one record per
+        # scheduled batch (wall-clock start, phase, requests, tokens) on the primary
+        # rank; written atomically every 64 steps, when the scheduler goes idle and at
+        # shutdown. Decode step time = the wall-clock delta between consecutive decode
+        # records.
+        self._step_trace_path = (
+            os.environ.get("MINISGL_SCHED_STEP_TRACE", "") if config.tp_info.is_primary() else ""
+        )
+        self._step_trace: list[tuple[int, str, int, int]] = []
+        if self._step_trace_path:
+            atexit.register(self._flush_step_trace)
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -196,6 +211,7 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        self._flush_step_trace()
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -248,6 +264,7 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        self._flush_step_trace()
         if self._nsys_runtime_started:
             torch.cuda.synchronize(self.device)
             torch.cuda.profiler.stop()
@@ -341,9 +358,29 @@ class Scheduler(SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
+    def _flush_step_trace(self) -> None:
+        if not self._step_trace_path or not self._step_trace:
+            return
+        tmp = self._step_trace_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "fields": ["start_time_ns", "phase", "num_reqs", "num_tokens"],
+                    "steps": self._step_trace,
+                },
+                f,
+            )
+        os.replace(tmp, self._step_trace_path)
+
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         self._maybe_start_nsys_runtime_capture()
         batch, sample_args, input_mapping, output_mapping = forward_input
+        if self._step_trace_path:
+            self._step_trace.append(
+                (time.time_ns(), batch.phase, batch.size, int(batch.positions.numel()))
+            )
+            if len(self._step_trace) % 64 == 0:
+                self._flush_step_trace()
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu

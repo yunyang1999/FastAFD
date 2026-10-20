@@ -340,6 +340,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--cuda-graph-bs",
+        type=str,
+        default="",
+        help="Explicit comma-separated list of CUDA graph batch sizes (overrides --cuda-graph-max-bs).",
+    )
+
+    parser.add_argument(
         "--num-tokenizer",
         "--tokenizer-count",
         type=int,
@@ -678,6 +685,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
     kwargs["afd_prompts"] = tuple(kwargs["afd_prompts"])
+    graph_bs = [int(v) for v in str(kwargs.pop("cuda_graph_bs") or "").split(",") if str(v).strip()]
+    kwargs["cuda_graph_bs"] = sorted(set(graph_bs)) if graph_bs else None
     kwargs["afd_decode_graph_bs"] = tuple(
         int(value)
         for value in str(kwargs["afd_decode_graph_bs"]).split(",")

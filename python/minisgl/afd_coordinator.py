@@ -47,6 +47,7 @@ from minisgl.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
     init_logger,
+    flush_nvtx_cpu_trace,
     init_nvtx_cpu_trace,
     load_tokenizer,
     nvtx_label,
@@ -664,6 +665,10 @@ class AfdCoordinator:
     def receive_msg(self, blocking: bool = False) -> list[BaseBackendMsg]:
         """Receive tokenizer/backend messages, matching Scheduler.receive_msg."""
         if blocking:
+            # nothing in flight: persist the CPU trace now (the final flush at exit is
+            # lost when the server is killed after a hung shutdown)
+            if self._cpu_trace_path:
+                flush_nvtx_cpu_trace()
             with nvtx_range("AFD_Coordinator_ReceiveMsg_Blocking"):
                 return self._recv_tokenizer_msgs()
         if self._tokenizer_inbox.empty():
@@ -947,7 +952,15 @@ class AfdCoordinator:
             return None
 
         with nvtx_range(
-            nvtx_label("AFD_Coordinator_BuildDpLaunches", step=step_id, phase=global_phase)
+            nvtx_label(
+                "AFD_Coordinator_BuildDpLaunches",
+                step=step_id,
+                phase=global_phase,
+                # real requests / tokens of the step across the DP ranks (step-time
+                # analysis uses them to tell full-batch steps from ramp / drain)
+                reqs=sum(int(b.size) for _, _, b in real_results),
+                dps=len(real_results),
+            )
         ):
             bucket_start_ns = time.perf_counter_ns()
             bucket = max(self._afd_dispatch_bucket(mp) for _, mp, _ in real_results)
@@ -1300,9 +1313,13 @@ class AfdCoordinator:
     @staticmethod
     def _afd_next_global_phase(scheds: list[CentralizedAfdDpScheduler]) -> str:
         # Prefill stays globally prioritized so AG/EG collectives never mix
-        # prefill and decode shapes in the same step.
+        # prefill and decode shapes in the same step. A request that already holds a
+        # table slot but still has prefill chunks (prompt longer than the step budget)
+        # keeps the prefill phase going even when the table is full; otherwise it would
+        # wait for a running request to finish and decode alone afterwards.
         if any(
-            s.prefill_manager.runnable and s.table_manager.available_size > 0
+            s.prefill_manager.runnable
+            and (s.table_manager.available_size > 0 or s.prefill_manager.has_chunked_in_flight)
             for s in scheds
         ):
             return "prefill"
