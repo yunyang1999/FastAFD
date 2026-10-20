@@ -100,10 +100,22 @@ def test_mhc(dev) -> None:
     from minisgl.kernel.dsv4_triton import hc_prenorm_mixes, hc_prenorm_mixes_ref
 
     g = torch.Generator(device=dev).manual_seed(3)
+    from minisgl.kernel.dsv4_triton import hc_pre_fused, hc_pre_split
+
     for T in (1, 8, 32, 128, 129, 300):
         x = (torch.randn(T, 4, 4096, generator=g, device=dev)).to(torch.bfloat16)
         fn = torch.randn(24, 4 * 4096, generator=g, device=dev) * 0.01
         report(f"mhc prenorm T={T}", hc_prenorm_mixes(x, fn, 1e-6), hc_prenorm_mixes_ref(x, fn, 1e-6), 5e-3)
+        scale = torch.rand(3, generator=g, device=dev) + 0.5
+        base = torch.randn(24, generator=g, device=dev) * 0.1
+        nw = (torch.randn(4096, generator=g, device=dev) * 0.1 + 1).to(torch.bfloat16)
+        y0, p0, c0 = hc_pre_fused(x, hc_prenorm_mixes_ref(x, fn, 1e-6), scale, base, sinkhorn_iters=20, eps=1e-6)
+        y0 = y0.float()
+        y0 = (y0 * torch.rsqrt(y0.square().mean(-1, keepdim=True) + 1e-6) * nw.float())
+        y1, p1, c1 = hc_pre_split(x, fn, scale, base, rms_eps=1e-6, sinkhorn_iters=20, eps=1e-6, norm_weight=nw, norm_eps=1e-6)
+        report(f"mhc pre fused+norm T={T} y", y1, y0, 2e-2)
+        report(f"mhc pre fused+norm T={T} post", p1, p0, 1e-3)
+        report(f"mhc pre fused+norm T={T} comb", c1, c0, 1e-3)
 
 
 def _mla_ref(q, kv_rows, lens, scale):
@@ -114,6 +126,42 @@ def _mla_ref(q, kv_rows, lens, scale):
         p = torch.softmax(s, dim=-1)
         outs.append(p @ kv[:, :512].float())
     return torch.stack(outs)
+
+
+def test_mla_perf(dev) -> None:
+    """K3 MLA decode through the backend's padding path at serving shapes (96/48 heads)."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    g = torch.Generator(device=dev).manual_seed(23)
+    ws = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    P = 64
+    for H in (96, 48):
+        Hp = 128 if H > 64 else 64
+        for B, C in ((8, 4096), (32, 4096), (128, 4096), (32, 32768)):
+            npg = (C + P - 1) // P
+            npg += npg % 2
+            cache = (torch.randn(B * npg + 2, P, 576, generator=g, device=dev) * 0.3).to(torch.bfloat16)
+            bt = torch.arange(B * npg, device=dev, dtype=torch.int32).view(B, npg)
+            sl = torch.full((B,), C, dtype=torch.int32, device=dev)
+            q = (torch.randn(B, 1, Hp, 576, generator=g, device=dev) * 0.3).to(torch.bfloat16)
+            q[:, :, H:] = 0
+
+            def run():
+                return trtllm_batch_decode_with_kv_cache_mla(
+                    query=q, kv_cache=cache.view(-1, 1, P, 576), workspace_buffer=ws, qk_nope_head_dim=128,
+                    kv_lora_rank=512, qk_rope_head_dim=64, block_tables=bt, seq_lens=sl, max_seq_len=C + 64,
+                    bmm1_scale=192**-0.5, bmm2_scale=1.0)
+
+            try:
+                o = run()
+                t = _time(run, iters=20)
+                ok = bool(torch.isfinite(o).all())
+                print(f"{'PASS' if ok else 'FAIL'} mla padded H={H}->{Hp} B={B} C={C}: {t:.1f} us", flush=True)
+                if not ok:
+                    FAILS.append(f"mla pad {H} {B} {C}")
+            except Exception as e:
+                print(f"FAIL mla padded H={H}->{Hp} B={B} C={C}: {type(e).__name__}: {str(e)[:160]}", flush=True)
+                FAILS.append(f"mla pad {H} {B} {C}")
 
 
 def test_mla(dev) -> None:
@@ -288,13 +336,70 @@ def test_wo_a(dev) -> None:
         report(f"wo_a fp8 einsum T={T}", got, ref, 3e-2)
 
 
+def _time(fn, iters=50):
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(10):
+            fn()
+    for _ in range(3):
+        g.replay()
+    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    a.record()
+    for _ in range(iters):
+        g.replay()
+    b.record()
+    b.synchronize()
+    return a.elapsed_time(b) / iters / 10 * 1e3
+
+
+def test_sparse_perf(dev) -> None:
+    """trtllm-gen sparse MLA (DSV4): native head count vs zero-padded to 128 heads
+    (the high-throughput 2-CTA kernel), correctness + timing."""
+    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+    g = torch.Generator(device=dev).manual_seed(21)
+    ws = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    rows = 1 << 20
+    kv = (torch.randn(rows, 576, generator=g, device=dev) * 0.3).to(torch.bfloat16)
+    kv[:, 512:] = 0
+    for H in (64, 32):
+        for B in (8, 32, 128):
+            for K in (128, 640):
+                idx = torch.randint(0, rows, (B, 1, K), generator=g, device=dev, dtype=torch.int32)
+                sl = torch.full((B,), K, dtype=torch.int32, device=dev)
+                q = (torch.randn(B, 1, H, 576, generator=g, device=dev) * 0.3).to(torch.bfloat16)
+                q[..., 512:] = 0
+                sinks = torch.randn(H, generator=g, device=dev) * 0.1
+
+                def run(qq, sk):
+                    return trtllm_batch_decode_with_kv_cache_mla(
+                        query=qq, kv_cache=kv.view(-1, 1, 64, 576), workspace_buffer=ws, qk_nope_head_dim=128,
+                        kv_lora_rank=512, qk_rope_head_dim=64, block_tables=idx, seq_lens=sl, max_seq_len=rows,
+                        sparse_mla_top_k=K, bmm1_scale=512**-0.5, bmm2_scale=1.0, sinks=sk, backend="trtllm-gen")
+
+                q128 = torch.zeros(B, 1, 128, 576, dtype=torch.bfloat16, device=dev)
+                q128[:, :, :H] = q
+                s128 = torch.zeros(128, device=dev)
+                s128[:H] = sinks
+                o1 = run(q, sinks).view(B, H, 512)
+                o2 = run(q128, s128).view(B, 128, 512)[:, :H]
+                report(f"sparse pad128 H={H} B={B} K={K}", o2, o1, 2e-2)
+                t1 = _time(lambda: run(q, sinks))
+                t2 = _time(lambda: run(q128, s128))
+                print(f"INFO sparse mla H={H} B={B} K={K}: native {t1:.1f} us, padded-128 {t2:.1f} us", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="kda,router,mhc,mla,attn_res,dsv4_elem,indexer,wo_a")
+    ap.add_argument("--only", default="kda,router,mhc,mla,attn_res,dsv4_elem,indexer,wo_a,mla_perf")
     args = ap.parse_args()
     dev = torch.device("cuda")
     only = set(args.only.split(","))
-    for name, fn in (("attn_res", test_attn_res), ("dsv4_elem", test_dsv4_elem), ("indexer", test_indexer), ("wo_a", test_wo_a)):
+    for name, fn in (("attn_res", test_attn_res), ("dsv4_elem", test_dsv4_elem), ("indexer", test_indexer), ("wo_a", test_wo_a),
+                     ("sparse_perf", test_sparse_perf), ("mla_perf", test_mla_perf)):
         if name in only:
             try:
                 fn(dev)

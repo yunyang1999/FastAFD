@@ -106,7 +106,11 @@ def dsv4_ref_params(model):
         P[f"{ap}.wq_b.weight"] = _w(a.wq_b)
         P[f"{ap}.wkv.weight"] = _w(a.wkv)
         P[f"{ap}.kv_norm.weight"] = a.kv_norm.weight
-        P[f"{ap}.wo_a"] = a.wo_a
+        if getattr(a, "wo_a_q", None) is not None:  # FP8 wo_a (sglang FP8_WO_A_GEMM): dequantised for the reference
+            q, sc = a.wo_a_q.weight, a.wo_a_q.weight_scale
+            P[f"{ap}.wo_a"] = (q.float() * sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[: q.shape[0], : q.shape[1]]).to(torch.bfloat16)
+        else:
+            P[f"{ap}.wo_a"] = a.wo_a
         P[f"{ap}.wo_b.weight"] = _w(a.wo_b)
         P[f"{ap}.attn_sink"] = a.attn_sink
         for cname, comp in (("compressor", a.compressor), ("indexer.compressor", a.indexer.compressor if a.indexer else None)):

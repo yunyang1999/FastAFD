@@ -147,6 +147,12 @@ def canon_and_export_dsv4(S: dict) -> tuple[dict, dict]:
             T[p + "attn.wo_a.weight"] = (q, "F8_E4M3")
             T[p + "attn.wo_a.scale"] = (e8m0_bytes(s), "F8_E8M0")
             continue
+        if rest == "attn.wo_a_q.weight":  # FP8 wo_a kept as stored in the checkpoint
+            T[p + "attn.wo_a.weight"] = (t, "F8_E4M3")
+            continue
+        if rest == "attn.wo_a_q.weight_scale":
+            T[p + "attn.wo_a.scale"] = (e8m0_bytes(t), "F8_E8M0")
+            continue
         if rest.startswith("ffn.experts."):
             leaf = rest.rsplit(".", 1)[1]
             if leaf != "w13":

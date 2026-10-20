@@ -289,10 +289,8 @@ def dsv4_core_fns(model, ids: list[int], B: int, dev):
         n = c._n_kv
         pooled = compressor_decode_step(kvsc[:, :n], kvsc[:, n:], c.ape, pos, md.tok_table, state_kv, state_sc,
                                         ratio=c.ratio, overlap=c.overlap, head_dim=c.head_dim)
-        rows = md.comp_write[c.ratio]
-        rows = torch.where(rows >= 0, rows + row_base, rows)
         had = hadamard_matrix(c.head_dim, str(dev)) if c.rotate else None
-        c._store(pooled, md.group_start[c.ratio], cos, sin, out_buf, rows, 2 if c.rotate else 1, had)
+        c._store(pooled, md.group_start[c.ratio], cos, sin, out_buf, md.comp_write[c.ratio], 2 if c.rotate else 1, had, row_base)
 
     def core(sparse_only: bool = False, indexer_only: bool = False):
         def fn():
@@ -312,7 +310,7 @@ def dsv4_core_fns(model, ids: list[int], B: int, dev):
                         continue
                 elif at.ratio == 128:
                     comp, cnt = md.c128_idx, md.n128_valid
-                idx, sl = backend.attn_index(md, comp, cnt)
+                idx, sl = backend.attn_index(md, comp, cnt, pool.comp_base if at.ratio == 4 else 0)
                 backend.sparse_attn(q, layer_kv, idx, at.attn_sink, a.head_dim**-0.5, sl)
 
         return fn
@@ -330,7 +328,7 @@ def _indexer_select(ix, iq, iw, md, cos, sin, pool, l, B):
                               get_global_ctx().attn_backend.max_c4_len)
     out = torch.empty((B, ix.topk), dtype=torch.int32, device=iq.device)
     topk_transform_v2(logits, md.n4_valid, md.c4_bt, out, 64, md.topk_plan)
-    return torch.where(out >= 0, out + pool.comp_base, -1), torch.clamp(md.n4_valid, max=ix.topk)
+    return out, md.n4_valid
 
 
 def k3_core_fns(model, ids: list[int], B: int, dev):
