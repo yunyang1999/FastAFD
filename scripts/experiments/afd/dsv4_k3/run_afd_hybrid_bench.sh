@@ -50,6 +50,8 @@ case "$ARCH" in
   kimi_k3|kimi_linear) ATTN_BACKEND=kimi; PAGE_SIZE=64 ;;
   *) echo "unsupported model_type $ARCH" >&2; exit 2 ;;
 esac
+# whole pages: the scheduler maps every page of a request into the page table
+MAX_SEQ_LEN=$(( (MAX_SEQ_LEN + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE ))
 
 mkdir -p "$RUN_DIR/ray_logs"
 # Placement: attention ranks fill the GPU nodes (sorted by IP) first, expert

@@ -597,10 +597,9 @@ def normalize_attention_backend_page_size(
 ) -> tuple[str, int]:
     backend = str(attention_backend)
     normalized_page_size = int(page_size)
-    if backend == "dsv4":
-        return backend, 128
-    if backend == "kimi":
-        return backend, 1
+    if backend in ("dsv4", "kimi"):
+        # fixed by the decode kernels (see minisgl.attention.model_attention_backend)
+        return backend, 256 if backend == "dsv4" else 64
     if backend == "auto":
         backend = "trtllm" if is_sm100_supported() else "fi"
     if "trtllm" in backend and normalized_page_size not in (16, 32, 64):
