@@ -118,12 +118,14 @@ def main() -> None:
     ap.add_argument("--skip", type=int, default=3)
     ap.add_argument("--timeout", type=float, default=7200)
     ap.add_argument("--server-log", default="")
+    ap.add_argument("--dp-ranks", type=int, default=1,
+                    help="DP attention ranks: the server log reports running requests per rank")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     bss = [int(x) for x in args.batch_sizes.split(",") if x]
     n_max = max(bss) * args.gpus
     prompts = real_prompt_ids(args.tokenizer, args.prompt_file, n_max, args.prompt_len)
-    log = {"prompt_len": args.prompt_len, "max_tokens": args.max_tokens, "gpus": args.gpus,
+    log = {"prompt_len": args.prompt_len, "max_tokens": args.max_tokens, "gpus": args.gpus, "dp_ranks": args.dp_ranks,
            "prompt_file": args.prompt_file, "temperature": args.temperature, "runs": []}
     for bs in bss:
         n = bs * args.gpus
@@ -159,8 +161,11 @@ def main() -> None:
         deltas = [(b - a) * 1e3 for a, b in zip(med, med[1:])]
         core = deltas[args.skip: len(deltas) - args.skip] if len(deltas) > 2 * args.skip + 2 else deltas
         ntok = sum(max(a) for a in arrivals.values()) if arrivals else 0
-        srv_ms, srv_run, srv_q = server_log_steps(args.server_log, t0, t1, n)
-        run = {"per_gpu_bs": bs, "num_requests": n, "completed_requests": len(arrivals), "start": t0, "end": t1,
+        srv_ms, srv_run, srv_q = server_log_steps(args.server_log, t0, t1, n // args.dp_ranks)
+        if args.dp_ranks > 1 and srv_ms is not None:
+            srv_ms = srv_ms  # per-rank step time (all DP ranks step together)
+        run = {"per_gpu_bs": bs, "num_requests": n, "requests_per_rank": n // args.dp_ranks,
+               "completed_requests": len(arrivals), "start": t0, "end": t1,
                "generated_tokens": ntok, "step_ms_all": [round(x, 4) for x in deltas],
                "step_ms_median": statistics.median(core) if core else None,
                "server_log_median_ms": srv_ms, "server_running_max": srv_run, "server_queue_max": srv_q,

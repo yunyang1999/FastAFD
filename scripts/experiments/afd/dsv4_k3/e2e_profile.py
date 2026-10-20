@@ -163,7 +163,8 @@ def main() -> None:
 
     per_step: dict[int, dict] = {}
     unattributed = 0.0
-    names: dict[str, list[float]] = {}
+    names: dict[str, dict[int, float]] = {}  # "cat|kernel" -> step -> ms
+    calls: dict[str, dict[int, int]] = {}
     for k in kernels:
         sid = step_of(k)
         dur = k.get("dur", 0) / 1e3  # us -> ms
@@ -176,7 +177,9 @@ def main() -> None:
         st["cats"][c] = st["cats"].get(c, 0.0) + dur
         st["intervals"].append((k["ts"] / 1e3, (k["ts"] + k.get("dur", 0)) / 1e3))
         st["n_kernels"] += 1
-        names.setdefault(f"{c}|{name}", []).append(dur)
+        nm = names.setdefault(f"{c}|{name}", {})
+        nm[sid] = nm.get(sid, 0.0) + dur
+        calls.setdefault(f"{c}|{name}", {})[sid] = calls.get(f"{c}|{name}", {}).get(sid, 0) + 1
         if labels:
             lab = label_of(k) or "(none)"
             lc = st["labels"].setdefault(lab, {})
@@ -216,7 +219,10 @@ def main() -> None:
             cats = sorted({c for sid in kept for c in per_step[sid]["buckets"].get(b, {})})
             bucket_med[b] = {c: statistics.median([per_step[sid]["buckets"].get(b, {}).get(c, 0.0) for sid in kept]) for c in cats}
             bucket_med[b]["total"] = statistics.median([sum(per_step[sid]["buckets"].get(b, {}).values()) for sid in kept])
-    top = sorted(((sum(v) / max(1, len(kept)), k, len(v)) for k, v in names.items()), reverse=True)[: args.top]
+    # kept steps only: ms per step and launches per step
+    top = sorted(((sum(v.get(sid, 0.0) for sid in kept) / max(1, len(kept)), k,
+                   sum(calls[k].get(sid, 0) for sid in kept) / max(1, len(kept))) for k, v in names.items()),
+                 reverse=True)[: args.top]
     out = {
         "schema": "fastafd.e2e-profile.v1",
         "role": args.role,
@@ -231,7 +237,7 @@ def main() -> None:
         "median_by_label": label_med,
         "median_by_bucket": bucket_med,
         "top_kernels_ms_per_step": [{"category": k.split("|")[0], "name": k.split("|", 1)[1][:120],
-                                     "ms_per_step": round(v, 4), "calls": n} for v, k, n in top],
+                                     "ms_per_step": round(v, 4), "calls_per_step": round(n, 1)} for v, k, n in top],
     }
     if args.step_ms and med:
         out["median"]["wait_outside_span_ms"] = args.step_ms - med.get("span_ms", 0.0)

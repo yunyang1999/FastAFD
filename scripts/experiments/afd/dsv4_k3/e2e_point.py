@@ -206,7 +206,8 @@ def load_sglang(run_dir: str, skip: int) -> tuple[list[dict], dict, dict]:
             continue
         s = stats(deltas, skip, "client inter-token latency (median over requests per token)")
         s["server_log_median_ms"] = run.get("server_log_median_ms", run.get("server_log_mean_ms"))
-        if run.get("server_queue_max", 0) > 0 or (run.get("server_running_max") and run["server_running_max"] < run["num_requests"]):
+        expected = run.get("requests_per_rank") or run["num_requests"]  # DP attention: running requests per rank
+        if run.get("server_queue_max", 0) > 0 or (run.get("server_running_max") and run["server_running_max"] < expected):
             print(f"skip b={run['per_gpu_bs']}: server queued requests (max running {run.get('server_running_max')}, "
                   f"queue {run.get('server_queue_max')}) -- batch did not fit", flush=True)
             continue
