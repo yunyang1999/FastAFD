@@ -530,6 +530,21 @@ attention kernels 11.3 (`kda_packed_decode` 5.3), copies 4.4, norms 1.0, router 
 -- both sides of the K3 unit are saturated at b 32, so the next unit (56A16F)
 rather than the batch is where K3 throughput would come from.
 
+**Rack units (56A16F, 40A32F).** The AFD runtime requires `attn_dp` and `mlp_dp` (and
+`attn_tp` and `mlp_tp`) to be mutually divisible, so these units cannot use the
+`mlp_dp = F` convention of the smaller units (56 is not a multiple of 16). They run
+with F = `mlp_dp x mlp_tp` and full-world EP (`--afd-mlp-ep-size F`): every expert GPU
+keeps E / F experts and receives the tokens of all attention ranks, i.e. the MegaMoE
+stage is the EP = F stage of the microbenchmark; `mlp_tp` only changes the expert-side
+grouping (each MLP DP group owns the requests of `attn_dp / mlp_dp` attention ranks)
+and the node placement (a DP group's TP ranks share a node). The "dense QKVO DP/TP =
+MLP factorisation" of the topology contract has no effect for DSV4 and K3: their
+expert workers run the MegaMoE kernel only (the 28A4F and K3 decompositions show no
+dense kernel on the expert side). `afd_cases.sh` derives the smallest valid `mlp_tp`:
+DSV4 56A16F attn TP1: mlp_dp 8 x tp 2; K3 56A16F TP1: 8 x 2, TP2 (attn_dp 28): 4 x 4;
+K3 40A32F TP1: 8 x 4, TP2 (attn_dp 20): 4 x 8. The factorisation was smoke-tested on
+12A4F with mlp_dp 2 x mlp_tp 2 before the rack jobs were queued.
+
 **Scripts** (`scripts/experiments/afd/dsv4_k3/`): `afd_cases.sh` (+ `E2E_OUT_DIR`,
 `ISL`, `OSL`, attention TP as a 6th case field), `colo_bench.sh` (FastAFD
 colocated), `sgl_colocated_bench.sh` + `sgl_bench_client.py` (sglang 0.5.18),
