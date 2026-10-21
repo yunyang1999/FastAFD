@@ -23,11 +23,26 @@ export PROMPT_LEN="${PROMPT_LEN:-1024}" MAX_TOKENS="${MAX_TOKENS:-64}" MEMORY_RA
 export DUMMY_WEIGHT="${DUMMY_WEIGHT:-1}" WAIT_READY_TIMEOUT="${WAIT_READY_TIMEOUT:-2400}"
 declare -A SRC=([dsv4_flash]=DeepSeek-V4-Flash [dsv4_pro]=DeepSeek-V4-Pro [k3]=Kimi-K3)
 for spec in $CASES; do
-  IFS=: read -r m A F BS MB TP <<< "$spec"
+  IFS=: read -r m A F BS MB TP MLPTP <<< "$spec"
   MB="${MB:-${AFD_NUM_MB:-2}}"
   TP="${TP:-${AFD_ATTN_TP_SIZE:-1}}"
   if (( A % TP != 0 )); then echo "A=$A not a multiple of TP=$TP" >&2; continue; fi
   DP=$(( A / TP ))
+  # The F expert GPUs are mlp_dp x mlp_tp with full-world EP (every F GPU holds E/F
+  # experts, fan-in from all attention ranks). The runtime needs attn_dp and mlp_dp
+  # mutually divisible (request ownership projects onto the MLP DP groups) and attn_tp,
+  # mlp_tp mutually divisible: take the smallest mlp_tp that satisfies both unless the
+  # 7th case field sets it (mlp_tp only changes the F-side grouping and placement; the
+  # expert layout and the MegaMoE stage are those of EP = F).
+  MLPTP="${MLPTP:-$(python - "$DP" "$F" "$TP" <<'PY'
+import sys
+dp, f, tp = map(int, sys.argv[1:4])
+md = lambda a, b: max(a, b) % min(a, b) == 0
+print(next((t for t in range(1, f + 1) if f % t == 0 and md(dp, f // t) and md(tp, t)), 0))
+PY
+)}"
+  if (( MLPTP == 0 || F % MLPTP != 0 )); then echo "no MLP factorisation for A=$A TP=$TP F=$F" >&2; continue; fi
+  MLPDP=$(( F / MLPTP ))
   depth="${LAYERS:-0}"
   mdir_var="MODEL_DIR_$m"
   if [[ -n "${!mdir_var:-}" ]]; then
@@ -41,9 +56,9 @@ for spec in $CASES; do
   else
     unset MINISGL_TOKENIZER_PATH
   fi
-  tag="${m}_L${depth}_${A}a${F}f_mb${MB}$( (( TP > 1 )) && echo "_tp${TP}" )${CASE_TAG_SUFFIX:-}_bs${BS//\//-}"
+  tag="${m}_L${depth}_${A}a${F}f_mb${MB}$( (( TP > 1 )) && echo "_tp${TP}" )$( (( MLPTP > 1 )) && echo "_mlptp${MLPTP}" )${CASE_TAG_SUFFIX:-}_bs${BS//\//-}"
   echo "===== $tag bs=${BS//\//,} $(date -u +%T)"
-  AFD_NUM_MB="$MB" AFD_ATTN_DP_SIZE="$DP" AFD_ATTN_TP_SIZE="$TP" AFD_MLP_DP_SIZE="$F" BATCH_SIZES="${BS//\//,}" MODEL_PATH="$mdir" RUN_DIR="$AFD_OUT_DIR/$tag" \
+  AFD_NUM_MB="$MB" AFD_ATTN_DP_SIZE="$DP" AFD_ATTN_TP_SIZE="$TP" AFD_MLP_DP_SIZE="$MLPDP" AFD_MLP_TP_SIZE="$MLPTP" BATCH_SIZES="${BS//\//,}" MODEL_PATH="$mdir" RUN_DIR="$AFD_OUT_DIR/$tag" \
     timeout "${CASE_TIMEOUT:-3600}" bash "$SCRIPT_DIR/run_afd_hybrid_bench.sh" > "$AFD_OUT_DIR/$tag.out" 2>&1
   rc=$?
   echo "rc=$rc $(date -u +%T)"
@@ -58,7 +73,7 @@ for spec in $CASES; do
       --a "$A" --f "$F" --mb "$MB" --attn-tp "$TP" --nodes "${SLURM_JOB_NUM_NODES:-0}" \
       --kv-dtype "${KV_DTYPE:-fp8_e4m3}" --moe-precision "${MOE_PRECISION:-mxfp4 (MegaMoE M2N stage)}" \
       --attention-kernels "${ATTN_KERNELS:-FastAFD sglang-path decode kernels}" --job-id "${SLURM_JOB_ID:-}" \
-      --case "$tag" --note "${NOTE:-}" || echo "e2e_point failed for $tag" >&2
+      --case "$tag" --note "${NOTE:-}${NOTE:+; }mlp_dp=$MLPDP mlp_tp=$MLPTP ep=$F" || echo "e2e_point failed for $tag" >&2
   fi
   sleep 20
 done
