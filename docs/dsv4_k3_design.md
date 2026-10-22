@@ -491,7 +491,7 @@ DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
 | 64 | 20.82 | 15.90 | 23.30 | 23.35 | 18.15 | 19.32 | 20.43 | 22.03 |
 | 128 | 29.39 | 18.96 | 33.53 | 33.58 | 22.81 | KV-limited | 24.86 | 27.22 |
 | 192 | 38.35 | 25.27 | 44.09 | prefill > 30 min | 25.86 | KV-limited | 28.24 | 31.63 |
-| 256 | launch failure | 31.66 | 54.80 | prefill > 30 min | 30.51 | - | 32.58 | - |
+| 256 | 47.30 (retry) | 31.66 | 54.80 | prefill > 30 min | 30.51 | - | 32.58 | - |
 
 Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 
@@ -501,15 +501,16 @@ Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 | 16 | 15.89 | 14.71 | 14.68 |
 | 32 | 18.13 | 15.23 | 15.25 |
 | 64 | 23.65 | 16.13 | 16.00 |
-| 96 | M2N fault (decode) | 17.81 | 17.23 |
+| 96 | 29.47 (retry) | 17.81 | 17.23 |
 | 128 | 35.33 | 20.27 | 20.69 |
 | 192 | M2N fault (prefill) | 26.20 | 28.27 |
 | 256 | 59.16 | 32.37 | 36.04 |
 
 12A4F b 96 = 25.14 ms. Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
-15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. The two
-16A4F failures are the MegaMoE M2N-stage launch failure described below (the same
-case ran with a single microbatch at 29.31 ms).
+15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
+b 96 died once in decode graph replay (the MegaMoE M2N-stage race described below)
+and then ran three times in a row: with a single microbatch 29.31 ms, with the
+original two microbatches 29.47 and 29.49 ms; the b 192 retry is pending.
 
 Per-GPU decode throughput at b = 256 (4K): 24A8F 6064 tok/s/GPU, 28A4F 4087, sglang
 EP4 8389, FastAFD colocated 7858; 12A4F at b = 192: 3755. The sglang EP4 4K sweep
@@ -517,8 +518,9 @@ repeated in a second job agreed within 1-3 % up to b = 192 and 10 % at b = 256
 (33.7 ms); the MegaMoE-a2a variant (`--moe-a2a-backend megamoe`) is within the same
 spread (results `variants/sglang_ep4mm`). sglang 32K b >= 128 queued requests (KV
 pool at mem-fraction 0.85 holds ~455 x 33K-token requests) and is not reported.
-12A4F b = 256 fails deterministically (`afd_ag_materialize` step 70 of the prefill,
-`CUDA error: unspecified launch failure`, twice). 28A4F 32K b >= 192: the prefill of
+12A4F b = 256 died twice in prefill (`afd_ag_materialize` step 70, `CUDA error:
+unspecified launch failure`) and passed on the third, unchanged attempt (47.30 ms) --
+the MegaMoE M2N-stage race described below. 28A4F 32K b >= 192: the prefill of
 5376 / 7168 requests x 33K tokens exceeds the per-case client timeout (30 min).
 
 Kimi-K3 (dummy weights, sampled decoding) AFD 16A16F m2, 4K/1K: b8 48.50, b16
