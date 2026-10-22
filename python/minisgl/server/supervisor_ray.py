@@ -172,7 +172,7 @@ def _prepend_path_entry(path_value: str, entry: str) -> str:
 
 # Prefixes forwarded as whole families (model kernel / cache knobs read inside the
 # workers and the torch.profiler window); mirrors afd_support._RUNTIME_ENV_PREFIXES.
-_RAY_ENV_PREFIXES = ("MINISGL_DSV4_", "MINISGL_K3_", "MINISGL_AFD_TORCH_PROFILE")
+_RAY_ENV_PREFIXES = ("MINISGL_DSV4_", "MINISGL_K3_", "MINISGL_AFD_TORCH_PROFILE", "CUDA_LAUNCH_BLOCKING")
 
 
 def _build_ray_runtime_env(nsys_bin: str | None = None) -> dict[str, dict[str, str]]:
