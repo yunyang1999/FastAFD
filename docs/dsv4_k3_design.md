@@ -549,8 +549,14 @@ projections (`MINISGL_K3_ATTN_FP8=1`, the AIC convention; the BF16-projection po
 FastAFD's engine with TP = EP across nodes (Ray launch), one server per batch size;
 `KV-limited` = the requests cannot all be resident (MLA KV replicated per TP rank).
 16A8F uses attention TP2 (F = 8 holds 168 GiB of routed weights per expert GPU, 2 GiB
-free after init); its b 192 / 256 prefill exceeded the 20-min client limit and is
-being retried with a longer one.
+free after init). `not resident (KDA state)`: at 4.6K context the attention side cannot
+hold b >= 192 requests per GPU -- the per-request KDA recurrent state (429 MiB at TP1,
+215 MiB at TP2, allocated for max-running-requests) plus the MLA KV replicated across
+the TP ranks exceed the 0.85 x 184 GiB budget (b 192 TP2: 81 GiB state + 50 GiB weights
+leave a 15.8 GiB KV pool = 132 resident requests of 384 per DP group, so the client's
+requests queue and the case runs past a 45-min limit); TP4 would halve the state but
+double the replicated KV. b 128 at TP2 is the largest resident batch (54 GiB state,
+47 GiB KV).
 
 | b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | 28A16F m2 (11 nodes, mlp_dp 4 x tp 4) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
 |---:|---:|---:|---:|---:|---:|
@@ -561,8 +567,8 @@ being retried with a longer one.
 | 64 | 54.80 | 76.95 | 55.02 | - | - |
 | 96 | 70.29 (TP2) | 81.24 | TP1 retry pending | - | - |
 | 128 | M2N fault (TP2, retry pending) | 87.91 | TP1 retry pending | - | - |
-| 192 | in progress (TP2) | retry pending (45-min limit) | TP1 retry pending | - | - |
-| 256 | in progress (TP2) | retry pending (45-min limit) | not attempted (TP1 memory) | - | - |
+| 192 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
+| 256 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
 
 16A16F at chunk 1024 (b 16 and b 128 TP2 died once each, see the fault notes); the earlier
 2048-chunk series failed at every b >= 64 and at 32K. 28A16F at attention TP2 (b >= 96) has
