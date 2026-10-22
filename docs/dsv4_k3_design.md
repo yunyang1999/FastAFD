@@ -540,9 +540,31 @@ unspecified launch failure`) and passed on the third, unchanged attempt (47.30 m
 the MegaMoE M2N-stage race described below. 28A4F 32K b >= 192: the prefill of
 5376 / 7168 requests x 33K tokens exceeds the per-case client timeout (30 min).
 
-Kimi-K3 (dummy weights, sampled decoding) AFD 16A16F m2, 4K/1K: b8 48.50, b16
-50.32, b32 57.62 ms (82 / 159 / 278 tok/s/GPU); b >= 64 and every 32K case fail in
-the K3 attention kernels (see above), no non-AFD baseline runs in sglang 0.5.18.
+Kimi-K3 (dummy weights, sampled decoding, 4K/1K), FP8 block-128 attention-side
+projections (`MINISGL_K3_ATTN_FP8=1`, the AIC convention; the BF16-projection points
+48.50 / 50.32 / 57.62 ms at b 8 / 16 / 32 are kept under `superseded/`). Colocated =
+FastAFD's engine with TP = EP across nodes (Ray launch), one server per batch size;
+`KV-limited` = the requests cannot all be resident (MLA KV replicated per TP rank).
+16A8F uses attention TP2 (F = 8 holds 168 GiB of routed weights per expert GPU, 2 GiB
+free after init); its b 192 / 256 prefill exceeded the 20-min client limit and is
+being retried with a longer one.
+
+| b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
+|---:|---:|---:|---:|---:|
+| 8 | 40.87 | 57.22 | 43.82 | 49.12 |
+| 12 | - | - | 50.49 | 57.59 |
+| 16 | M2N fault (retry pending) | 66.33 | KV-limited (216 of 256) | KV-limited (417 of 512) |
+| 32 | 47.30 | 72.38 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
+| 64 | in progress | 76.95 | - | - |
+| 96 | in progress | 81.24 | - | - |
+| 128 | in progress | 87.91 | - | - |
+| 192 | in progress | client timeout | - | - |
+| 256 | in progress | client timeout | - | - |
+
+16A16F b 8-32 at chunk 1024 (b 16 died once, see the fault notes); the earlier 2048-chunk
+series failed at every b >= 64 and at 32K. Colocated per-GPU throughput at b 12: EP16
+238 tok/s/GPU, EP32 208; AFD 16A16F at b 32: 338 tok/s/GPU. No K3 baseline runs in
+sglang 0.5.18 (remote code).
 
 Qwen3-235B-A22B-FP8, real weights, AFD 16A8F (6 GPU nodes + GPU-less head), 4K/1K,
 regression protocol: m = 2: b32 15.38, b64 18.03, b96 22.83, b128 26.16 ms; m = 3:
