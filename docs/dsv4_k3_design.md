@@ -504,16 +504,18 @@ Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 | 64 | 23.65 | 20.62 | 16.13 | 16.00 | 23.67 |
 | 96 | 29.47 (retry) | 24.08 (retry) | 17.81 | 17.23 | - |
 | 128 | 35.33 | 27.64 | 20.27 | 20.69 | 41.18 |
-| 192 | M2N fault (both attempts) | 35.10 (retry) | 26.20 | 28.27 | 60.38 |
+| 192 | 47.03 (retry, 1K chunks) | 35.10 (retry) | 26.20 | 28.27 | 60.38 |
 | 256 | 59.16 | 42.77 | 32.37 | 36.04 | 79.26 |
 
 Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
 15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
 b 96 died once in decode graph replay (the MegaMoE M2N-stage race described below)
 and then ran three times in a row: with a single microbatch 29.31 ms, with the
-original two microbatches 29.47 and 29.49 ms. 16A4F b 192 died the same way in both attempts
-(the asynchronous launch failure surfaced in the prefill forward right after graph capture)
-and is reported as failed: one retry per failed point. 20A4F b 96 and b 192 died in the
+original two microbatches 29.47 and 29.49 ms. 16A4F b 192 died the same way in two attempts
+(the asynchronous launch failure surfaced in the prefill forward right after graph capture) and
+passed on a third with 1024-token prefill chunks (`AFD_MAX_BATCHED_TOKENS=1024`, exchange bucket
+1024; see the K3 fault notes below): 47.03 ms. Prefill chunking does not touch the timed decode
+steps, so the point is comparable; the chunk size is recorded in its note. 20A4F b 96 and b 192 died in the
 M2N stage on their first attempt and passed on the retry (24.08 and 35.10 ms).
 
 Per-GPU decode throughput at b = 256 (4K): 24A8F 6064 tok/s/GPU, 28A4F 4087, sglang
