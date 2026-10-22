@@ -496,16 +496,16 @@ DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
 
 Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 
-| b | 16A4F m2 (5 nodes) | 20A4F m2 (6 nodes) | 16A8F m2 (6 nodes) | 28A8F m2 (9 nodes, mlp_dp 4 x tp 2) |
-|---:|---:|---:|---:|---:|
-| 8 | 14.73 | 14.99 | 14.36 | 14.32 |
-| 16 | 15.89 | 16.12 | 14.71 | 14.68 |
-| 32 | 18.13 | 17.70 | 15.23 | 15.25 |
-| 64 | 23.65 | 20.62 | 16.13 | 16.00 |
-| 96 | 29.47 (retry) | 24.08 (retry) | 17.81 | 17.23 |
-| 128 | 35.33 | 27.64 | 20.27 | 20.69 |
-| 192 | M2N fault (both attempts) | 35.10 (retry) | 26.20 | 28.27 |
-| 256 | 59.16 | 42.77 | 32.37 | 36.04 |
+| b | 16A4F m2 (5 nodes) | 20A4F m2 (6 nodes) | 16A8F m2 (6 nodes) | 28A8F m2 (9 nodes, mlp_dp 4 x tp 2) | 56A16F m2 (18 nodes, mlp_dp 8 x tp 2) |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 14.73 | 14.99 | 14.36 | 14.32 | 14.57 |
+| 16 | 15.89 | 16.12 | 14.71 | 14.68 | 14.54 |
+| 32 | 18.13 | 17.70 | 15.23 | 15.25 | 15.91 |
+| 64 | 23.65 | 20.62 | 16.13 | 16.00 | 23.67 |
+| 96 | 29.47 (retry) | 24.08 (retry) | 17.81 | 17.23 | - |
+| 128 | 35.33 | 27.64 | 20.27 | 20.69 | 41.18 |
+| 192 | M2N fault (both attempts) | 35.10 (retry) | 26.20 | 28.27 | 60.38 |
+| 256 | 59.16 | 42.77 | 32.37 | 36.04 | 79.26 |
 
 Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
 15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
