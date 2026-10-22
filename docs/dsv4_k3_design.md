@@ -565,8 +565,8 @@ double the replicated KV. b 128 at TP2 is the largest resident batch (54 GiB sta
 | 16 | 43.53 (retry) | 66.33 | 41.55 | 44.13 | KV-limited (216 of 256) | KV-limited (417 of 512) |
 | 32 | 47.30 | 72.38 | 45.60 | 47.61 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
 | 64 | 54.80 | 76.95 | 53.55 | 55.02 | - | - |
-| 96 | 70.29 (TP2) | 81.24 | 71.28 (TP2) | TP1 retry pending | - | - |
-| 128 | 79.81 (TP2, retry) | 87.91 | 78.86 (TP2) | TP1 retry pending | - | - |
+| 96 | 70.29 (TP2) | 81.24 | 71.28 (TP2) | OOM at TP1 | - | - |
+| 128 | 79.81 (TP2, retry) | 87.91 | 78.86 (TP2) | OOM at TP1 | - | - |
 | 192 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
 | 256 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
 
@@ -575,8 +575,10 @@ the retry with the 4096 bucket); the earlier 2048-chunk series failed at every b
 at 32K. 32K/1K (TP2, 4096 bucket): b 8 = 42.51 ms; b 16 and b 32 died once each (retry pending);
 b 64 is not resident. F = 32 vs F = 16 on the same 16-GPU attention side saves 1-2.7 ms per
 step at b 8-64 (TP1) and nothing at TP2 b 96-128, where the attention side dominates. 28A16F at attention TP2 (b >= 96) has
-no node-local MLP factorisation (attn_dp 14 -> mlp_dp 2 x tp 8), so those batches run at TP1;
-20A32F has none at any attention TP (replaced by 16A32F, pending). Colocated per-GPU throughput at b 12: EP16
+no node-local MLP factorisation (attn_dp 14 -> mlp_dp 2 x tp 8), and at TP1 b 96 the attention
+workers run out of memory (FP8 weights + 40 GiB of KDA state + the exchange buffers; all 28
+ranks), so the 28A16F curve ends at b 64; 20A32F has no factorisation at any attention TP
+(replaced by 16A32F). Colocated per-GPU throughput at b 12: EP16
 238 tok/s/GPU, EP32 208; AFD 16A16F at b 32: 338 tok/s/GPU. No K3 baseline runs in
 sglang 0.5.18 (remote code).
 
