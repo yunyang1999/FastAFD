@@ -417,8 +417,10 @@ weight is loaded; `--skip-tokenizer-init` does not bypass it and
 `--language-model-only` rejects the architecture. The attempted configuration was
 4 nodes, `--tp 16 --dp 8 --enable-dp-attention --ep-size 16 --load-format dummy`
 (attention TP2 per DP rank) with a2a `none` and `deepep`; the K3 colocated side
-therefore stays AIC-based. FastAFD's colocated engine is single-node and K3 does
-not fit on one node.
+therefore stays AIC-based for sglang. FastAFD's colocated engine runs K3 across nodes
+with `--launch-backend ray` (TP = EP = 16 or 32, one server per batch size); its MLA
+latent KV is replicated across the TP ranks (27 KB/token/rank), which bounds the
+resident batch to b <= 12 per GPU at 4.6K context (see the K3 table below).
 
 **Launch failures in the MegaMoE M2N stage (K3, and rarely DSV4).** 16A16F runs at
 4K for b <= 32 per attention GPU; b = 64 (TP1), b = 96/128 (TP2) and every 32K case
@@ -437,8 +439,17 @@ runs K3 at b 32-256 / 4K and b 8-64 / 32K-64K with compute-sanitizer memcheck
 clean. Raising the KV budget (`MEMORY_RATIO=0.95`) only moved the capacity
 failures (2423 / 15441 pages per rank at b = 64 TP1 / b = 128 TP2 under 0.85) into
 the same kernel fault. The kernel fix is in the DeepGEMM-based M2N CUDA code
-(kernel-owner territory); the dual-lane (microbatch) pipeline as the trigger is
-being tested with mb = 1 runs.
+(kernel-owner territory). Setting experiments on 16A16F (FP8 projections): one
+microbatch does not avoid it (b 64 TP1 with mb 1 and mb 2 at memory ratio 0.95 both
+died; b 96 TP2 mb 1 passed, 77.5 ms); a 4x exchange bucket
+(`MINISGL_AFD_MAX_COMM_TOKENS=8192`) is memory-infeasible (attention-side OOM at TP1
+b 64 and TP2 b 128); 1024-token prefill chunks (`AFD_MAX_BATCHED_TOKENS=1024`,
+exchange bucket 1024) passed b 64 TP1 and b 128 TP2 with two microbatches and b 8 / 32
+of the re-measured series, but b 16 died the same way -- the fault is data- and
+timing-dependent and smaller chunks only lower its rate (DSV4 16A4F b 192 also passed
+with them after two failures). Prefill chunking does not touch the timed decode steps,
+so chunk-1024 points keep their labels, with the chunk size in each point note; a
+failed batch gets one retry. A 4096-token bucket with 1024-token chunks is being tested.
 
 **Colocated breakdown, measured** (TP4 = EP4, real weights, 4K/1K, GB200; ms per
 decode step, medians over 5 profiled steps; `graph` = CUDA graphs as in the sweep,
