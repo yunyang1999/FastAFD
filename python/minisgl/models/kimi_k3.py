@@ -137,6 +137,13 @@ class _Fp8BlockSpec:
 _ATTN_QUANT = _Fp8BlockSpec() if _ATTN_FP8 else None
 
 
+def _q128(n_local: int, k_local: int):
+    """FP8 block spec when this rank's weight shard is a whole number of 128 x 128 blocks
+    (the per-token activation cast needs K_local % 128 == 0, e.g. the dense MLP's
+    33792 / 16 = 2112 at TP16 is not), else bf16."""
+    return _ATTN_QUANT if (_ATTN_QUANT is not None and n_local % 128 == 0 and k_local % 128 == 0) else None
+
+
 def _fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     """x @ w^T with a DeepGEMM-layout block-128 FP8 weight (per-token FP8 activations)."""
     from minisgl.kernel import deepgemm as deep_gemm
@@ -167,8 +174,11 @@ class SituMLP(BaseOP):
     def __init__(self, args: K3Args, inter: int, quant=None):
         # quant only for the dense layer's MLP: the shared experts' gate_up is merged into
         # the bf16/fp32 MoE front GEMM
-        self.gate_up_proj = LinearColParallelMerged(args.dim, [inter, inter], has_bias=False, quant=quant)
-        self.down_proj = LinearRowParallel(inter, args.dim, has_bias=False, quant=quant)
+        tp = get_tp_info()
+        il = div_even(inter, tp.size)
+        q = quant if (quant is not None and il % 128 == 0 and args.dim % 128 == 0) else None
+        self.gate_up_proj = LinearColParallelMerged(args.dim, [inter, inter], has_bias=False, quant=q)
+        self.down_proj = LinearRowParallel(inter, args.dim, has_bias=False, quant=q)
         self._beta = args.situ_beta
         self._lbeta = args.situ_lbeta
 
@@ -190,16 +200,17 @@ class KimiDeltaAttention(BaseOP):
         self.h_local = div_even(args.kda_heads, tp.size)
         D = args.kda_dim
         proj = args.kda_heads * D
-        self.qkv_proj = LinearColParallelMerged(args.dim, [proj, proj, proj], has_bias=False, quant=_ATTN_QUANT)
+        pl = div_even(proj, tp.size)  # this rank's projection width
+        self.qkv_proj = LinearColParallelMerged(args.dim, [proj, proj, proj], has_bias=False, quant=_q128(pl, args.dim))
         self.conv_weight = torch.empty(3 * self.h_local * D, args.conv_k, dtype=torch.float32)
         self.f_a_proj = LinearReplicatedQ(args.dim, D)
-        self.f_b_proj = LinearColParallelMerged(D, [proj], has_bias=False, quant=_ATTN_QUANT)
+        self.f_b_proj = LinearColParallelMerged(D, [proj], has_bias=False, quant=_q128(pl, D))
         self.b_proj = LinearColParallelMerged(args.dim, [args.kda_heads], has_bias=False)
-        self.g_proj = LinearColParallelMerged(args.dim, [proj], has_bias=False, quant=_ATTN_QUANT)
+        self.g_proj = LinearColParallelMerged(args.dim, [proj], has_bias=False, quant=_q128(pl, args.dim))
         self.A_log = torch.empty(self.h_local, dtype=torch.float32)
         self.dt_bias = torch.empty(self.h_local * D, dtype=torch.float32)
         self.o_norm = RMSNorm(D, eps=args.eps)
-        self.o_proj = LinearRowParallel(proj, args.dim, has_bias=False, quant=_ATTN_QUANT)
+        self.o_proj = LinearRowParallel(proj, args.dim, has_bias=False, quant=_q128(args.dim, pl))
         self._D = D
         self._lb = args.lower_bound
         self._eps = args.eps
@@ -302,12 +313,14 @@ class KimiMLAAttention(BaseOP):
         self.q_a_proj = LinearReplicatedQ(args.dim, args.q_lora)
         self.q_a_layernorm = RMSNorm(args.q_lora, eps=args.eps)
         qk = args.qk_nope + args.qk_rope
-        self.q_b_proj = LinearColParallelMerged(args.q_lora, [args.n_heads * qk], has_bias=False, quant=_ATTN_QUANT)
+        self.q_b_proj = LinearColParallelMerged(args.q_lora, [args.n_heads * qk], has_bias=False,
+                                                quant=_q128(div_even(args.n_heads * qk, tp.size), args.q_lora))
         self.kv_a_proj_with_mqa = LinearReplicatedQ(args.dim, args.kv_lora + args.qk_rope)
         self.kv_a_layernorm = RMSNorm(args.kv_lora, eps=args.eps)
         self.kv_b_proj = LinearColParallelMerged(args.kv_lora, [args.n_heads * (args.qk_nope + args.v_head)], has_bias=False)
-        self.g_proj = LinearColParallelMerged(args.dim, [args.n_heads * args.v_head], has_bias=False, quant=_ATTN_QUANT)
-        self.o_proj = LinearRowParallel(args.n_heads * args.v_head, args.dim, has_bias=False, quant=_ATTN_QUANT)
+        vl = div_even(args.n_heads * args.v_head, tp.size)
+        self.g_proj = LinearColParallelMerged(args.dim, [args.n_heads * args.v_head], has_bias=False, quant=_q128(vl, args.dim))
+        self.o_proj = LinearRowParallel(args.n_heads * args.v_head, args.dim, has_bias=False, quant=_q128(args.dim, vl))
         self._a = args
         self._w_uk: torch.Tensor | None = None
         self._w_uv_t: torch.Tensor | None = None
