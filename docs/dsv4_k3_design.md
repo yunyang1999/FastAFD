@@ -572,8 +572,8 @@ double the replicated KV. b 128 at TP2 is the largest resident batch (54 GiB sta
 
 16A16F at chunk 1024 (b 16 and b 128 TP2 died once each with the 1024 bucket and passed on
 the retry with the 4096 bucket); the earlier 2048-chunk series failed at every b >= 64 and
-at 32K. 32K/1K (TP2, 4096 bucket): b 8 = 42.51 ms; b 16 and b 32 died once each (retry pending);
-b 64 is not resident. F = 32 vs F = 16 on the same 16-GPU attention side saves 1-2.7 ms per
+at 32K. 32K/1K (TP2, 4096 bucket): b 8 = 42.51 ms; b 16 and b 32 died in the M2N stage in both
+attempts (the fault is most frequent at 32K); b 64 is not resident. F = 32 vs F = 16 on the same 16-GPU attention side saves 1-2.7 ms per
 step at b 8-64 (TP1) and nothing at TP2 b 96-128, where the attention side dominates. 28A16F at attention TP2 (b >= 96) has
 no node-local MLP factorisation (attn_dp 14 -> mlp_dp 2 x tp 8), and at TP1 b 96 the attention
 workers run out of memory (FP8 weights + 40 GiB of KDA state + the exchange buffers; all 28
