@@ -449,7 +449,10 @@ of the re-measured series, but b 16 died the same way -- the fault is data- and
 timing-dependent and smaller chunks only lower its rate (DSV4 16A4F b 192 also passed
 with them after two failures). Prefill chunking does not touch the timed decode steps,
 so chunk-1024 points keep their labels, with the chunk size in each point note; a
-failed batch gets one retry. A 4096-token bucket with 1024-token chunks is being tested.
+failed batch gets one retry. A 4096-token bucket with 1024-token chunks (`MINISGL_AFD_MAX_COMM_TOKENS=4096`,
++10 GiB per side) passed 16A16F b 16 / 32 / 64 (43.33 / 47.02 / 54.47 ms) where bucket 1024
+had failed b 16 and b 128 TP2 once each; it is the setting for the remaining K3 jobs and
+retries (recorded in the point notes).
 
 **Colocated breakdown, measured** (TP4 = EP4, real weights, 4K/1K, GB200; ms per
 decode step, medians over 5 profiled steps; `graph` = CUDA graphs as in the sweep,
@@ -549,20 +552,22 @@ FastAFD's engine with TP = EP across nodes (Ray launch), one server per batch si
 free after init); its b 192 / 256 prefill exceeded the 20-min client limit and is
 being retried with a longer one.
 
-| b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
-|---:|---:|---:|---:|---:|
-| 8 | 40.87 | 57.22 | 43.82 | 49.12 |
-| 12 | - | - | 50.49 | 57.59 |
-| 16 | M2N fault (retry pending) | 66.33 | KV-limited (216 of 256) | KV-limited (417 of 512) |
-| 32 | 47.30 | 72.38 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
-| 64 | in progress | 76.95 | - | - |
-| 96 | in progress | 81.24 | - | - |
-| 128 | in progress | 87.91 | - | - |
-| 192 | in progress | client timeout | - | - |
-| 256 | in progress | client timeout | - | - |
+| b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | 28A16F m2 (11 nodes, mlp_dp 4 x tp 4) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 40.87 | 57.22 | 42.03 | 43.82 | 49.12 |
+| 12 | - | - | - | 50.49 | 57.59 |
+| 16 | M2N fault (retry pending) | 66.33 | 44.13 | KV-limited (216 of 256) | KV-limited (417 of 512) |
+| 32 | 47.30 | 72.38 | 47.61 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
+| 64 | 54.80 | 76.95 | 55.02 | - | - |
+| 96 | 70.29 (TP2) | 81.24 | TP1 retry pending | - | - |
+| 128 | M2N fault (TP2, retry pending) | 87.91 | TP1 retry pending | - | - |
+| 192 | in progress (TP2) | retry pending (45-min limit) | TP1 retry pending | - | - |
+| 256 | in progress (TP2) | retry pending (45-min limit) | not attempted (TP1 memory) | - | - |
 
-16A16F b 8-32 at chunk 1024 (b 16 died once, see the fault notes); the earlier 2048-chunk
-series failed at every b >= 64 and at 32K. Colocated per-GPU throughput at b 12: EP16
+16A16F at chunk 1024 (b 16 and b 128 TP2 died once each, see the fault notes); the earlier
+2048-chunk series failed at every b >= 64 and at 32K. 28A16F at attention TP2 (b >= 96) has
+no node-local MLP factorisation (attn_dp 14 -> mlp_dp 2 x tp 8), so those batches run at TP1;
+20A32F has none at any attention TP (replaced by 16A32F, pending). Colocated per-GPU throughput at b 12: EP16
 238 tok/s/GPU, EP32 208; AFD 16A16F at b 32: 338 tok/s/GPU. No K3 baseline runs in
 sglang 0.5.18 (remote code).
 
