@@ -503,14 +503,16 @@ Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 | 64 | 23.65 | 16.13 | 16.00 |
 | 96 | 29.47 (retry) | 17.81 | 17.23 |
 | 128 | 35.33 | 20.27 | 20.69 |
-| 192 | M2N fault (prefill) | 26.20 | 28.27 |
+| 192 | M2N fault (both attempts) | 26.20 | 28.27 |
 | 256 | 59.16 | 32.37 | 36.04 |
 
 12A4F b 96 = 25.14 ms. Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
 15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
 b 96 died once in decode graph replay (the MegaMoE M2N-stage race described below)
 and then ran three times in a row: with a single microbatch 29.31 ms, with the
-original two microbatches 29.47 and 29.49 ms; the b 192 retry is pending.
+original two microbatches 29.47 and 29.49 ms. 16A4F b 192 died the same way in both attempts
+(the asynchronous launch failure surfaced in the prefill forward right after graph capture)
+and is reported as failed: one retry per failed point.
 
 Per-GPU decode throughput at b = 256 (4K): 24A8F 6064 tok/s/GPU, 28A4F 4087, sglang
 EP4 8389, FastAFD colocated 7858; 12A4F at b = 192: 3755. The sglang EP4 4K sweep
