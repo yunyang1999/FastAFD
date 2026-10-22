@@ -489,6 +489,7 @@ DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
 | 16 | 15.46 | 14.66 | 16.52 | 16.89 | 12.63 | 13.08 | 15.67 | 16.29 |
 | 32 | 17.15 | 15.21 | 18.66 | 18.91 | 14.41 | 14.87 | 17.60 | 18.32 |
 | 64 | 20.82 | 15.90 | 23.30 | 23.35 | 18.15 | 19.32 | 20.43 | 22.03 |
+| 96 | 25.14 | 16.29 | 28.40 | - | - | - | - | - |
 | 128 | 29.39 | 18.96 | 33.53 | 33.58 | 22.81 | KV-limited | 24.86 | 27.22 |
 | 192 | 38.35 | 25.27 | 44.09 | prefill > 30 min | 25.86 | KV-limited | 28.24 | 31.63 |
 | 256 | 47.30 (retry) | 31.66 | 54.80 | prefill > 30 min | 30.51 | - | 32.58 | - |
@@ -506,7 +507,7 @@ Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 | 192 | M2N fault (both attempts) | 35.10 (retry) | 26.20 | 28.27 |
 | 256 | 59.16 | 42.77 | 32.37 | 36.04 |
 
-12A4F b 96 = 25.14 ms. Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
+Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
 15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
 b 96 died once in decode graph replay (the MegaMoE M2N-stage race described below)
 and then ran three times in a row: with a single microbatch 29.31 ms, with the
