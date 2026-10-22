@@ -493,6 +493,24 @@ DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
 | 192 | 38.35 | 25.27 | 44.09 | prefill > 30 min | 25.86 | KV-limited | 28.24 | 31.63 |
 | 256 | launch failure | 31.66 | 54.80 | prefill > 30 min | 30.51 | - | 32.58 | - |
 
+Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
+
+| b | 16A4F m2 (5 nodes) | 16A8F m2 (6 nodes) | 28A8F m2 (9 nodes, mlp_dp 4 x tp 2) |
+|---:|---:|---:|---:|
+| 8 | 14.73 | 14.36 | 14.32 |
+| 16 | 15.89 | 14.71 | 14.68 |
+| 32 | 18.13 | 15.23 | 15.25 |
+| 64 | 23.65 | 16.13 | 16.00 |
+| 96 | M2N fault (decode) | 17.81 | 17.23 |
+| 128 | 35.33 | 20.27 | 20.69 |
+| 192 | M2N fault (prefill) | 26.20 | 28.27 |
+| 256 | 59.16 | 32.37 | 36.04 |
+
+12A4F b 96 = 25.14 ms. Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
+15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. The two
+16A4F failures are the MegaMoE M2N-stage launch failure described below (the same
+case ran with a single microbatch at 29.31 ms).
+
 Per-GPU decode throughput at b = 256 (4K): 24A8F 6064 tok/s/GPU, 28A4F 4087, sglang
 EP4 8389, FastAFD colocated 7858; 12A4F at b = 192: 3755. The sglang EP4 4K sweep
 repeated in a second job agreed within 1-3 % up to b = 192 and 10 % at b = 256
