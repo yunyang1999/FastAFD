@@ -340,7 +340,13 @@ def _make_ray_actor():
             if server_args.ray_log_dir:
                 _redirect_stdio_to_log_file(_get_ray_rank_log_path(server_args))
             _prepare_ray_node_scoped_cache(server_args)
-            os.environ["MINISGL_DEVICE_INDEX"] = "0"
+            # torch symmetric memory (the colocated MegaMoE buffer) exchanges CUDA device
+            # ordinals; with Ray's per-actor CUDA_VISIBLE_DEVICES every rank is cuda:0 and
+            # same-node ranks look overlapping. Expose the node and bind to Ray's physical
+            # GPU instead, as the AFD workers do.
+            gpu_ids = tuple(ray.get_gpu_ids())
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            os.environ["MINISGL_DEVICE_INDEX"] = str(int(gpu_ids[0])) if gpu_ids else "0"
 
             def _target() -> None:
                 try:

@@ -169,18 +169,18 @@ def k3_ref_params(model):
         ap = f"{pf}.self_attn"
         if layer.is_kda:
             proj = a.kda_heads * a.kda_dim
-            qkv = sa.qkv_proj.weight
+            qkv = _w(sa.qkv_proj)
             P[f"{ap}.q_proj.weight"], P[f"{ap}.k_proj.weight"], P[f"{ap}.v_proj.weight"] = qkv.split(proj, 0)
             cw = sa.conv_weight
             P[f"{ap}.q_conv1d.weight"], P[f"{ap}.k_conv1d.weight"], P[f"{ap}.v_conv1d.weight"] = cw.split(proj, 0)
             for k in ("f_a_proj", "f_b_proj", "b_proj", "g_proj", "o_proj"):
-                P[f"{ap}.{k}.weight"] = getattr(sa, k).weight
+                P[f"{ap}.{k}.weight"] = _w(getattr(sa, k))
             P[f"{ap}.A_log"] = sa.A_log
             P[f"{ap}.dt_bias"] = sa.dt_bias
             P[f"{ap}.o_norm.weight"] = sa.o_norm.weight
         else:
             for k in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "g_proj", "o_proj"):
-                P[f"{ap}.{k}.weight"] = getattr(sa, k).weight
+                P[f"{ap}.{k}.weight"] = _w(getattr(sa, k))
             P[f"{ap}.q_a_layernorm.weight"] = sa.q_a_layernorm.weight
             P[f"{ap}.kv_a_layernorm.weight"] = sa.kv_a_layernorm.weight
         if layer.block_sparse_moe is not None:
@@ -196,9 +196,9 @@ def k3_ref_params(model):
             P[f"{mp}.shared_experts.down_proj.weight"] = mo.shared_experts.down_proj.weight
             experts[i] = mo.experts.bf16()
         else:
-            gu = layer.mlp.gate_up_proj.weight
+            gu = _w(layer.mlp.gate_up_proj)
             P[f"{pf}.mlp.gate_proj.weight"], P[f"{pf}.mlp.up_proj.weight"] = gu.chunk(2, 0)
-            P[f"{pf}.mlp.down_proj.weight"] = layer.mlp.down_proj.weight
+            P[f"{pf}.mlp.down_proj.weight"] = _w(layer.mlp.down_proj)
     return P, experts
 
 

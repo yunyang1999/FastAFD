@@ -50,6 +50,17 @@ def apply_attn_res(prefix_sum, block_residual, proj_w, norm_w, eps):
     return torch.matmul(probs, vf).squeeze(1).to(v.dtype)
 
 
+def _aq(x):
+    """FP8 activation emulation (per-token 128-wide groups, power-of-two scales) for the
+    projections the engine runs as FP8 block GEMMs under MINISGL_K3_ATTN_FP8=1."""
+    import os
+    if os.environ.get("MINISGL_K3_ATTN_FP8", "0") != "1":
+        return x
+    from ref_dsv4 import act_quant_inplace
+
+    return act_quant_inplace(x.clone().float(), 128).to(x.dtype)
+
+
 class RefKDA:
     def __init__(self, P, pf, cfg, dev):
         self.P, self.pf, self.cfg = P, pf, cfg
@@ -75,10 +86,11 @@ class RefKDA:
 
     def forward(self, x):  # x [L, dim]
         H, D = self.H, self.D
-        q = self.short_conv(F.linear(x, self.w("q_proj.weight")), 0, "q_conv1d.weight")
-        k = self.short_conv(F.linear(x, self.w("k_proj.weight")), 1, "k_conv1d.weight")
-        v = self.short_conv(F.linear(x, self.w("v_proj.weight")), 2, "v_conv1d.weight")
-        g = F.linear(F.linear(x, self.w("f_a_proj.weight")), self.w("f_b_proj.weight"))
+        xq = _aq(x)
+        q = self.short_conv(F.linear(xq, self.w("q_proj.weight")), 0, "q_conv1d.weight")
+        k = self.short_conv(F.linear(xq, self.w("k_proj.weight")), 1, "k_conv1d.weight")
+        v = self.short_conv(F.linear(xq, self.w("v_proj.weight")), 2, "v_conv1d.weight")
+        g = F.linear(_aq(F.linear(x, self.w("f_a_proj.weight"))), self.w("f_b_proj.weight"))
         beta = F.linear(x, self.w("b_proj.weight")).float()
         L = x.shape[0]
         q, k, v, g = (t.view(L, H, D) for t in (q, k, v, g))
@@ -97,11 +109,11 @@ class RefKDA:
             out[t] = torch.einsum("hvk,hk->hv", S, qt)
         self.S = S
         o = out.to(x.dtype)
-        gate = F.linear(x, self.w("g_proj.weight")).view(L, H, D)
+        gate = F.linear(_aq(x), self.w("g_proj.weight")).view(L, H, D)
         of = o.float()
         of = of * torch.rsqrt(of.square().mean(-1, keepdim=True) + self.eps) * self.w("o_norm.weight").float()
         of = of * torch.sigmoid(gate.float())
-        return F.linear(of.to(x.dtype).view(L, H * D), self.w("o_proj.weight"))
+        return F.linear(_aq(of.to(x.dtype).view(L, H * D)), self.w("o_proj.weight"))
 
 
 class RefMLA:
@@ -120,7 +132,7 @@ class RefMLA:
     def forward(self, x):  # [L, dim]
         L = x.shape[0]
         H, nope, rope, vd = self.H, self.nope, self.rope, self.v
-        q = F.linear(rmsnorm(F.linear(x, self.w("q_a_proj.weight")), self.w("q_a_layernorm.weight"), self.eps), self.w("q_b_proj.weight"))
+        q = F.linear(_aq(rmsnorm(F.linear(x, self.w("q_a_proj.weight")), self.w("q_a_layernorm.weight"), self.eps)), self.w("q_b_proj.weight"))
         q = q.view(L, H, nope + rope)
         ckv = F.linear(x, self.w("kv_a_proj_with_mqa.weight"))
         k_pass, k_rot = ckv[:, : self.lora], ckv[:, self.lora :]
@@ -139,8 +151,8 @@ class RefMLA:
         scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
         probs = scores.softmax(-1).to(x.dtype)
         o = torch.einsum("hlt,thd->lhd", probs.float(), self.v_cache.float()).to(x.dtype).reshape(L, H * vd)
-        o = o * torch.sigmoid(F.linear(x, self.w("g_proj.weight")))
-        return F.linear(o, self.w("o_proj.weight"))
+        o = o * torch.sigmoid(F.linear(_aq(x), self.w("g_proj.weight")))
+        return F.linear(_aq(o), self.w("o_proj.weight"))
 
 
 class RefKimiK3:
@@ -161,8 +173,9 @@ class RefKimiK3:
         self.lbeta = cfg.get("activation_situ_linear_beta")
 
     def mlp(self, x, pf):
-        gu = torch.cat([F.linear(x, self.P[f"{pf}.gate_proj.weight"]), F.linear(x, self.P[f"{pf}.up_proj.weight"])], -1)
-        return F.linear(situ_and_mul(gu, self.beta, self.lbeta), self.P[f"{pf}.down_proj.weight"])
+        xq = _aq(x)
+        gu = torch.cat([F.linear(xq, self.P[f"{pf}.gate_proj.weight"]), F.linear(xq, self.P[f"{pf}.up_proj.weight"])], -1)
+        return F.linear(_aq(situ_and_mul(gu, self.beta, self.lbeta)), self.P[f"{pf}.down_proj.weight"])
 
     def moe(self, x, layer):
         cfg, P = self.cfg, self.P

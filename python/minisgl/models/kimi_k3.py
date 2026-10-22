@@ -122,6 +122,30 @@ import os as _os
 # decode kernels: "sglang" (vendored sglang 0.5.18 decode chain) or "legacy"
 _KDA_DECODE_IMPL = _os.environ.get("MINISGL_K3_KDA_DECODE", "sglang").lower()
 _ATTN_RES_IMPL = _os.environ.get("MINISGL_K3_ATTN_RES", "sglang").lower()
+# MINISGL_K3_ATTN_FP8=1: FP8 block-128 weights + per-token FP8 activations (DeepGEMM) for the
+# large attention-side projections (KDA q|k|v|g, f_b, o; MLA q_b, g, o; dense-layer MLP), the
+# AIC convention for the attention side. Small / oddly shaped ones (f_a, b (N = heads), q_a,
+# kv_a (N = 576), the absorbed kv_b and the MoE front with its fp32 router) stay bf16.
+_ATTN_FP8 = _os.environ.get("MINISGL_K3_ATTN_FP8", "0") == "1"
+
+
+class _Fp8BlockSpec:
+    method = "fp8"
+    weight_block_size = (128, 128)
+
+
+_ATTN_QUANT = _Fp8BlockSpec() if _ATTN_FP8 else None
+
+
+def _fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """x @ w^T with a DeepGEMM-layout block-128 FP8 weight (per-token FP8 activations)."""
+    from minisgl.kernel import deepgemm as deep_gemm
+
+    x2 = x.contiguous().view(-1, x.shape[-1])
+    xq, xs = deep_gemm.per_token_cast_to_fp8(x2, use_ue8m0=True, gran_k=128, use_packed_ue8m0=True)
+    out = torch.empty((xq.size(0), w_fp8.size(0)), dtype=torch.bfloat16, device=x.device)
+    deep_gemm.fp8_gemm_nt((xq, xs), (w_fp8, sf), out, disable_ue8m0_cast=False)
+    return out
 _ROUTER_IMPL = _os.environ.get("MINISGL_K3_ROUTER", "sglang").lower()
 _MOE_FRONT_IMPL = _os.environ.get("MINISGL_K3_MOE_FRONT", "sglang").lower()
 
@@ -140,9 +164,11 @@ def _all_reduce(x: torch.Tensor) -> torch.Tensor:
 class SituMLP(BaseOP):
     """gate_up (column parallel, merged) -> SiTU*mul -> down (row parallel)."""
 
-    def __init__(self, args: K3Args, inter: int):
-        self.gate_up_proj = LinearColParallelMerged(args.dim, [inter, inter], has_bias=False)
-        self.down_proj = LinearRowParallel(inter, args.dim, has_bias=False)
+    def __init__(self, args: K3Args, inter: int, quant=None):
+        # quant only for the dense layer's MLP: the shared experts' gate_up is merged into
+        # the bf16/fp32 MoE front GEMM
+        self.gate_up_proj = LinearColParallelMerged(args.dim, [inter, inter], has_bias=False, quant=quant)
+        self.down_proj = LinearRowParallel(inter, args.dim, has_bias=False, quant=quant)
         self._beta = args.situ_beta
         self._lbeta = args.situ_lbeta
 
@@ -164,20 +190,21 @@ class KimiDeltaAttention(BaseOP):
         self.h_local = div_even(args.kda_heads, tp.size)
         D = args.kda_dim
         proj = args.kda_heads * D
-        self.qkv_proj = LinearColParallelMerged(args.dim, [proj, proj, proj], has_bias=False)
+        self.qkv_proj = LinearColParallelMerged(args.dim, [proj, proj, proj], has_bias=False, quant=_ATTN_QUANT)
         self.conv_weight = torch.empty(3 * self.h_local * D, args.conv_k, dtype=torch.float32)
         self.f_a_proj = LinearReplicatedQ(args.dim, D)
-        self.f_b_proj = LinearColParallelMerged(D, [proj], has_bias=False)
+        self.f_b_proj = LinearColParallelMerged(D, [proj], has_bias=False, quant=_ATTN_QUANT)
         self.b_proj = LinearColParallelMerged(args.dim, [args.kda_heads], has_bias=False)
-        self.g_proj = LinearColParallelMerged(args.dim, [proj], has_bias=False)
+        self.g_proj = LinearColParallelMerged(args.dim, [proj], has_bias=False, quant=_ATTN_QUANT)
         self.A_log = torch.empty(self.h_local, dtype=torch.float32)
         self.dt_bias = torch.empty(self.h_local * D, dtype=torch.float32)
         self.o_norm = RMSNorm(D, eps=args.eps)
-        self.o_proj = LinearRowParallel(proj, args.dim, has_bias=False)
+        self.o_proj = LinearRowParallel(proj, args.dim, has_bias=False, quant=_ATTN_QUANT)
         self._D = D
         self._lb = args.lower_bound
         self._eps = args.eps
         self._w_qkvg: torch.Tensor | None = None
+        self._w_qkvg_sf: torch.Tensor | None = None  # DeepGEMM-layout block scales (fp8 path)
         self._w_fab: torch.Tensor | None = None
 
     def merge_weights(self) -> None:
@@ -185,10 +212,26 @@ class KimiDeltaAttention(BaseOP):
         GEMM. The original modules keep views into the merged buffers."""
         if self._w_qkvg is not None:
             return
-        w = torch.cat([self.qkv_proj.weight, self.g_proj.weight], dim=0)
-        n = self.qkv_proj.weight.shape[0]
-        self.qkv_proj.weight, self.g_proj.weight = w[:n], w[n:]
-        self._w_qkvg = w
+        if self.qkv_proj.weight.dtype == torch.float8_e4m3fn:
+            # normalise both FP8 blocks (DeepGEMM re-quantises in place on first use), then
+            # merge weights and block scales and lay the merged scales out for DeepGEMM
+            from minisgl.kernel import deepgemm as deep_gemm
+
+            self.qkv_proj._fp8_weight_for_deepgemm()
+            self.g_proj._fp8_weight_for_deepgemm()
+            w = torch.cat([self.qkv_proj.weight, self.g_proj.weight], dim=0)
+            sf = torch.cat([self.qkv_proj.weight_scale, self.g_proj.weight_scale], dim=0).contiguous()
+            n = self.qkv_proj.weight.shape[0]
+            self.qkv_proj.weight, self.g_proj.weight = w[:n], w[n:]
+            self._w_qkvg = w
+            self._w_qkvg_sf = deep_gemm.transform_sf_into_required_layout(
+                sf.unsqueeze(0), w.size(0), w.size(1), (1, 128, 128), 1, False, False
+            ).squeeze(0)
+        else:
+            w = torch.cat([self.qkv_proj.weight, self.g_proj.weight], dim=0)
+            n = self.qkv_proj.weight.shape[0]
+            self.qkv_proj.weight, self.g_proj.weight = w[:n], w[n:]
+            self._w_qkvg = w
         wf = torch.cat([self.f_a_proj.weight, self.b_proj.weight], dim=0)
         nf = self.f_a_proj.weight.shape[0]
         self.f_a_proj.weight, self.b_proj.weight = wf[:nf], wf[nf:]
@@ -198,7 +241,10 @@ class KimiDeltaAttention(BaseOP):
         if self._w_qkvg is None:
             self.merge_weights()
         H, D = self.h_local, self._D
-        y = F.linear(x, self._w_qkvg)
+        if self._w_qkvg_sf is not None:
+            y = _fp8_linear(x, self._w_qkvg, self._w_qkvg_sf)
+        else:
+            y = F.linear(x, self._w_qkvg)
         qkv, gate = y[:, : 3 * H * D], y[:, 3 * H * D :]
         fab = F.linear(x, self._w_fab)
         g_raw = self.f_b_proj.forward(fab[:, :D])
@@ -256,12 +302,12 @@ class KimiMLAAttention(BaseOP):
         self.q_a_proj = LinearReplicatedQ(args.dim, args.q_lora)
         self.q_a_layernorm = RMSNorm(args.q_lora, eps=args.eps)
         qk = args.qk_nope + args.qk_rope
-        self.q_b_proj = LinearColParallelMerged(args.q_lora, [args.n_heads * qk], has_bias=False)
+        self.q_b_proj = LinearColParallelMerged(args.q_lora, [args.n_heads * qk], has_bias=False, quant=_ATTN_QUANT)
         self.kv_a_proj_with_mqa = LinearReplicatedQ(args.dim, args.kv_lora + args.qk_rope)
         self.kv_a_layernorm = RMSNorm(args.kv_lora, eps=args.eps)
         self.kv_b_proj = LinearColParallelMerged(args.kv_lora, [args.n_heads * (args.qk_nope + args.v_head)], has_bias=False)
-        self.g_proj = LinearColParallelMerged(args.dim, [args.n_heads * args.v_head], has_bias=False)
-        self.o_proj = LinearRowParallel(args.n_heads * args.v_head, args.dim, has_bias=False)
+        self.g_proj = LinearColParallelMerged(args.dim, [args.n_heads * args.v_head], has_bias=False, quant=_ATTN_QUANT)
+        self.o_proj = LinearRowParallel(args.n_heads * args.v_head, args.dim, has_bias=False, quant=_ATTN_QUANT)
         self._a = args
         self._w_uk: torch.Tensor | None = None
         self._w_uv_t: torch.Tensor | None = None
@@ -460,7 +506,7 @@ class KimiDecoderLayer(BaseOP):
             self.block_sparse_moe = KimiLatentMoE(args, with_experts=not afd_attention_side)
             self.mlp = None
         else:
-            self.mlp = SituMLP(args, args.dense_inter)
+            self.mlp = SituMLP(args, args.dense_inter, quant=_ATTN_QUANT)
             self.block_sparse_moe = None
         self.input_layernorm = RMSNorm(args.dim, eps=args.eps)
         self.post_attention_layernorm = RMSNorm(args.dim, eps=args.eps)
