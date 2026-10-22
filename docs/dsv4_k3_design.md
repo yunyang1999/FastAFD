@@ -420,14 +420,25 @@ weight is loaded; `--skip-tokenizer-init` does not bypass it and
 therefore stays AIC-based. FastAFD's colocated engine is single-node and K3 does
 not fit on one node.
 
-**Kimi-K3 AFD limits in this build.** 16A16F runs at 4K for b <= 32 per attention
-GPU; b = 64 (TP1) and b = 96/128 (TP2) and every 32K case fail with
-`CUDA error: unspecified launch failure` in the K3 attention path
-(`k3_attn_res.attn_res_fused_tma` in the first forward at 64 requests per rank;
-decode graph replay at 192 requests per TP2 pair and at 16 requests x 33K context),
-after KV capacity was raised (`MEMORY_RATIO=0.95`) for the cases that first failed
-to schedule (0.85 left 2423 / 15441 pages per rank for b = 64 TP1 / b = 128 TP2).
-These are kernel defects outside this phase.
+**Launch failures in the MegaMoE M2N stage (K3, and rarely DSV4).** 16A16F runs at
+4K for b <= 32 per attention GPU; b = 64 (TP1), b = 96/128 (TP2) and every 32K case
+died with `CUDA error: unspecified launch failure`, as did DSV4 16A4F b = 96 (decode
+graph replay) and 12A4F b = 256 (prefill). Attribution with `CUDA_LAUNCH_BLOCKING=1`
+forwarded to the workers: the 32K TP2 b8 case then fails at launch on both sides of
+the expert exchange -- attention workers in `mega_moe_m2n_ag`
+(`sm100_mega_moe_m2n.hpp:107`, eager prefill dispatch) and expert workers in the
+persistent `mega_moe_m2n_eg` kernel (`:348`), `CUDA_ERROR_LAUNCH_FAILED` -- while
+the 4K TP1 b64 case runs to completion under serialised launches (73.8 ms, not a
+measurement). The fault is therefore a device fault inside the vendored MegaMoE
+M2N kernels (timing-dependent at 4K, reproducible at 32K TP2), surfaced earlier at
+the next synchronisation point (which happened to be `attn_res_fused_tma`). The
+standalone attention-side harness (`tests/dsv4_k3/bench_aside.py`, no M2N stage)
+runs K3 at b 32-256 / 4K and b 8-64 / 32K-64K with compute-sanitizer memcheck
+clean. Raising the KV budget (`MEMORY_RATIO=0.95`) only moved the capacity
+failures (2423 / 15441 pages per rank at b = 64 TP1 / b = 128 TP2 under 0.85) into
+the same kernel fault. The kernel fix is in the DeepGEMM-based M2N CUDA code
+(kernel-owner territory); the dual-lane (microbatch) pipeline as the trigger is
+being tested with mb = 1 runs.
 
 **Colocated breakdown, measured** (TP4 = EP4, real weights, 4K/1K, GB200; ms per
 decode step, medians over 5 profiled steps; `graph` = CUDA graphs as in the sweep,
