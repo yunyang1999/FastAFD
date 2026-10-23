@@ -510,16 +510,16 @@ DeepSeek-V4-Flash, real weights, batch per GPU (AFD: per attention GPU):
 
 Additional DeepSeek-V4-Flash units (real weights, m = 2, 4K/1K; same protocol):
 
-| b | 16A4F m2 (5 nodes) | 20A4F m2 (6 nodes) | 16A8F m2 (6 nodes) | 28A8F m2 (9 nodes, mlp_dp 4 x tp 2) | 56A16F m2 (18 nodes, mlp_dp 8 x tp 2) |
-|---:|---:|---:|---:|---:|---:|
-| 8 | 14.73 | 14.99 | 14.36 | 14.32 | 14.57 |
-| 16 | 15.89 | 16.12 | 14.71 | 14.68 | 14.54 |
-| 32 | 18.13 | 17.70 | 15.23 | 15.25 | 15.91 |
-| 64 | 23.65 | 20.62 | 16.13 | 16.00 | 23.67 |
-| 96 | 29.47 (retry) | 24.08 (retry) | 17.81 | 17.23 | - |
-| 128 | 35.33 | 27.64 | 20.27 | 20.69 | 41.18 |
-| 192 | 47.03 (retry, 1K chunks) | 35.10 (retry) | 26.20 | 28.27 | 60.38 |
-| 256 | 59.16 | 42.77 | 32.37 | 36.04 | 79.26 |
+| b | 16A4F m2 (5 nodes) | 20A4F m2 (6 nodes) | 16A8F m2 (6 nodes) | 28A8F m2 (9 nodes, mlp_dp 4 x tp 2) | 56A16F m2 (18 nodes, mlp_dp 8 x tp 2) | 40A32F m2 (18 nodes, mlp_dp 8 x tp 4) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 14.73 | 14.99 | 14.36 | 14.32 | 14.57 | 14.34 |
+| 16 | 15.89 | 16.12 | 14.71 | 14.68 | 14.54 | 14.66 |
+| 32 | 18.13 | 17.70 | 15.23 | 15.25 | 15.91 | 15.13 |
+| 64 | 23.65 | 20.62 | 16.13 | 16.00 | 23.67 | 17.07 |
+| 96 | 29.47 (retry) | 24.08 (retry) | 17.81 | 17.23 | - | - |
+| 128 | 35.33 | 27.64 | 20.27 | 20.69 | 41.18 | 29.54 |
+| 192 | 47.03 (retry, 1K chunks) | 35.10 (retry) | 26.20 | 28.27 | 60.38 | 41.26 |
+| 256 | 59.16 | 42.77 | 32.37 | 36.04 | 79.26 | 54.89 |
 
 Doubling F from 4 to 8 at A = 16 saves 7.5 ms at b 64 and
 15 ms at b 128; 28A8F vs 28A4F saves 7.3 / 12.8 / 18.8 ms at b 64 / 128 / 256. 16A4F
@@ -558,17 +558,17 @@ requests queue and the case runs past a 45-min limit); TP4 would halve the state
 double the replicated KV. b 128 at TP2 is the largest resident batch (54 GiB state,
 47 GiB KV).
 
-| b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | 16A32F m2 (12 nodes, mlp_dp 16 x tp 2) | 28A16F m2 (11 nodes, mlp_dp 4 x tp 4) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 40.87 | 57.22 | 39.77 | 42.03 | 43.82 | 49.12 |
-| 12 | - | - | - | - | 50.49 | 57.59 |
-| 16 | 43.53 (retry) | 66.33 | 41.55 | 44.13 | KV-limited (216 of 256) | KV-limited (417 of 512) |
-| 32 | 47.30 | 72.38 | 45.60 | 47.61 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
-| 64 | 54.80 | 76.95 | 53.55 | 55.02 | - | - |
-| 96 | 70.29 (TP2) | 81.24 | 71.28 (TP2) | OOM at TP1 | - | - |
-| 128 | 79.81 (TP2, retry) | 87.91 | 78.86 (TP2) | OOM at TP1 | - | - |
-| 192 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
-| 256 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | - | - |
+| b | 16A16F m2 (8 nodes) | 16A8F m2 attn-TP2 (6 nodes) | 16A32F m2 (12 nodes, mlp_dp 16 x tp 2) | 28A16F m2 (11 nodes, mlp_dp 4 x tp 4) | 56A16F m2 (18 nodes, mlp_dp 8 x tp 2) | 40A32F m2 (18 nodes, mlp_dp 8 x tp 4) | colocated TP16 = EP16 (4 nodes) | colocated TP32 = EP32 (8 nodes) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 40.87 | 57.22 | 39.77 | 42.03 | 42.58 | 39.95 | 43.82 | 49.12 |
+| 12 | - | - | - | - | - | - | 50.49 | 57.59 |
+| 16 | 43.53 (retry) | 66.33 | 41.55 | 44.13 | OOM (exchange buffer) | 41.77 | KV-limited (216 of 256) | KV-limited (417 of 512) |
+| 32 | 47.30 | 72.38 | 45.60 | 47.61 | OOM (exchange buffer) | 45.76 | KV-limited (160 of 512) | KV-limited (361 of 1024) |
+| 64 | 54.80 | 76.95 | 53.55 | 55.02 | OOM (exchange buffer) | OOM (exchange buffer) | - | - |
+| 96 | 70.29 (TP2) | 81.24 | 71.28 (TP2) | OOM at TP1 | not run | not run | - | - |
+| 128 | 79.81 (TP2, retry) | 87.91 | 78.86 (TP2) | OOM at TP1 | not run | not run | - | - |
+| 192 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not run | not run | - | - |
+| 256 | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not resident (KDA state) | not run | not run | - | - |
 
 16A16F at chunk 1024 (b 16 and b 128 TP2 died once each with the 1024 bucket and passed on
 the retry with the 4096 bucket); the earlier 2048-chunk series failed at every b >= 64 and
@@ -578,7 +578,12 @@ step at b 8-64 (TP1) and nothing at TP2 b 96-128, where the attention side domin
 no node-local MLP factorisation (attn_dp 14 -> mlp_dp 2 x tp 8), and at TP1 b 96 the attention
 workers run out of memory (FP8 weights + 40 GiB of KDA state + the exchange buffers; all 28
 ranks), so the 28A16F curve ends at b 64; 20A32F has no factorisation at any attention TP
-(replaced by 16A32F). Colocated per-GPU throughput at b 12: EP16
+(replaced by 16A32F). Rack units (K3 convention via the rack runner): the MegaMoE exchange
+staging buffer is sized bucket x attention fan-in per MLP DP group (7 for 56A16F, 5 for
+40A32F; `raw_max_comm_tokens` 28672 / 20480), so with the 4096 bucket the 56 attention
+workers of 56A16F had 4 GiB free at b 8 and ran out of memory at b >= 16, and 40A32F at
+b 64 (`OOM (exchange buffer)`); b >= 96 was not run (TP2 unplaceable, TP1 not resident).
+A 1024 bucket would fit those batches but was not retried. Colocated per-GPU throughput at b 12: EP16
 238 tok/s/GPU, EP32 208; AFD 16A16F at b 32: 338 tok/s/GPU. No K3 baseline runs in
 sglang 0.5.18 (remote code).
 
